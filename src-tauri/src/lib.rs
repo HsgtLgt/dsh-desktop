@@ -5,7 +5,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -24,6 +24,13 @@ const DEFAULT_PORT: u16 = 3080;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(240);
 const QUICK_ASK_SHORTCUT: &str = "Alt+Space";
 const QUICK_ASK_SHORTCUT_FALLBACK: &str = "Alt+Shift+Space";
+/// Capped size of the shared boot-process output buffer.
+const MAX_BOOT_LOG: usize = 8192;
+/// npm 11+/12 refuses to run dependency install scripts by default. dsh's
+/// terminal stack (node-pty, koffi) needs its postinstall scripts, so pass
+/// the allow-list through to npx's underlying install. Ignored by older npm.
+const NPM_ALLOW_SCRIPTS: &str =
+    "@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs";
 const NODE_SETUP_PS1: &str = r#"$ErrorActionPreference = 'Stop'
 $idx = curl.exe -sL --fail 'https://nodejs.org/dist/index.json'
 $json = $idx | ConvertFrom-Json
@@ -40,6 +47,9 @@ Remove-Item $zip -Force
 struct AppState {
     /// The dsh child process we spawned (None if we connected to an existing one).
     child: Mutex<Option<Child>>,
+    /// Shared capped buffer of the boot process's stdout+stderr, so failures
+    /// (e.g. npx errors) can be surfaced to the user instead of a bare exit code.
+    boot_log: Arc<Mutex<String>>,
     /// Directory of a portable Node.js we installed ourselves.
     node_dir: Mutex<Option<PathBuf>>,
     /// The running quick-ask headless task, if any.
@@ -103,34 +113,115 @@ fn system_node_version() -> Option<String> {
     }
 }
 
-/// Spawn `npx --yes @deepseek-ai/dsh web --port <port>`.
-/// If `node_dir` is given (a portable node we installed), use its npx and put
-/// it first on PATH.
-fn spawn_dsh(node_dir: Option<&Path>, port: u16) -> std::io::Result<Child> {
+/// True when a `dsh` executable is resolvable on PATH (a global npm install).
+/// Preferring it over npx sidesteps npm 12's broken npx cache-lock
+/// (ECOMPROMISED) and its default block on dependency install scripts.
+fn find_global_dsh() -> bool {
+    let probe = if cfg!(windows) { "where" } else { "which" };
+    Command::new(probe)
+        .arg("dsh")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Drain a child's stdout/stderr into the shared boot log (capped), so the
+/// pipe can never fill up and stall the server, and the tail stays available
+/// for error reporting.
+fn tee_into_log<R: Read + Send + 'static>(mut reader: R, log: Arc<Mutex<String>>) {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if std::env::var_os("DSH_DESKTOP_LOG_DIR").is_some() {
+                        debug_log(&format!("[dsh] {s}"));
+                    }
+                    let mut log = log.lock().unwrap();
+                    log.push_str(&s);
+                    if log.len() > MAX_BOOT_LOG {
+                        let cut = log.len() - MAX_BOOT_LOG;
+                        log.drain(..cut);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Last ~1500 chars of the boot process output, for error details.
+fn boot_log_tail(app: &AppHandle) -> String {
+    let state = app.state::<AppState>();
+    let log = state.boot_log.lock().unwrap();
+    let trimmed = log.trim_end();
+    trimmed
+        .chars()
+        .rev()
+        .take(1500)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+/// Spawn the dsh web server (`dsh web --port <port>`).
+///
+/// Launcher order:
+/// 1. A globally installed `dsh` on PATH — bypasses npx entirely, which
+///    avoids npm 12's broken npx cache-lock (ECOMPROMISED) and its default
+///    refusal to run dependency install scripts (node-pty/koffi need them).
+/// 2. `npx --yes @deepseek-ai/dsh` — either the portable Node's npx
+///    (`node_dir`) or the system npx.
+fn spawn_dsh(
+    node_dir: Option<&Path>,
+    port: u16,
+    boot_log: Arc<Mutex<String>>,
+) -> std::io::Result<Child> {
     let mut cmd = Command::new("cmd");
     cmd.arg("/C");
-    if let Some(dir) = node_dir {
+    let use_global = find_global_dsh();
+    if use_global {
+        debug_log("spawn_dsh: using globally installed `dsh`");
+        cmd.arg("dsh");
+    } else if let Some(dir) = node_dir {
+        debug_log("spawn_dsh: using portable npx");
         cmd.arg(dir.join("npx.cmd"));
         let path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{};{}", dir.display(), path));
+        cmd.arg("--yes").arg("@deepseek-ai/dsh");
     } else {
-        cmd.arg("npx");
+        debug_log("spawn_dsh: using system npx");
+        cmd.arg("npx").arg("--yes").arg("@deepseek-ai/dsh");
     }
-    cmd.arg("--yes")
-        .arg("@deepseek-ai/dsh")
-        .arg("web")
+    // npm 11+/12 blocks dependency install scripts by default; let npx's
+    // underlying install still run dsh's required native-module scripts.
+    // Ignored silently by older npm versions.
+    cmd.env("npm_config_allow_scripts", NPM_ALLOW_SCRIPTS);
+    cmd.arg("web")
         .arg("--port")
         .arg(port.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdin(Stdio::null());
+    // Capture stdout/stderr into the boot log (drained by tee threads, so the
+    // pipe can never fill up). Previously they were discarded, leaving only a
+    // bare "进程已退出" with no diagnostics.
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         // CREATE_NO_WINDOW: don't flash a console window.
         cmd.creation_flags(0x08000000);
     }
-    cmd.spawn()
+    let mut child = cmd.spawn()?;
+    if let Some(out) = child.stdout.take() {
+        tee_into_log(out, boot_log.clone());
+    }
+    if let Some(err) = child.stderr.take() {
+        tee_into_log(err, boot_log);
+    }
+    Ok(child)
 }
 
 fn debug_log(msg: &str) {
@@ -219,10 +310,11 @@ fn boot(app: AppHandle) {
 fn start_dsh(app: &AppHandle, node_dir: Option<&Path>) {
     let p = port();
     debug_log(&format!(
-        "start_dsh: spawning npx dsh web on port {p} (node_dir={:?})",
+        "start_dsh: spawning dsh web on port {p} (node_dir={:?})",
         node_dir.map(|d| d.display().to_string())
     ));
-    let child = match spawn_dsh(node_dir, p) {
+    let boot_log = app.state::<AppState>().boot_log.clone();
+    let child = match spawn_dsh(node_dir, p, boot_log) {
         Ok(c) => c,
         Err(e) => {
             emit(
@@ -244,7 +336,7 @@ fn start_dsh(app: &AppHandle, node_dir: Option<&Path>) {
             navigate_to_dsh(app);
             return;
         }
-        // If our child died, report it.
+        // If our child died, report it (with the captured output tail).
         let died = app
             .state::<AppState>()
             .child
@@ -253,22 +345,24 @@ fn start_dsh(app: &AppHandle, node_dir: Option<&Path>) {
             .as_mut()
             .and_then(|c| c.try_wait().ok().flatten());
         if let Some(status) = died {
-            emit(
-                app,
-                "error",
-                "DSH 进程已退出",
-                Some(format!("退出码：{status}")),
-            );
+            let tail = boot_log_tail(app);
+            let detail = if tail.is_empty() {
+                format!("退出码：{status}")
+            } else {
+                format!("退出码：{status}\n\n--- dsh 输出尾部 ---\n{tail}")
+            };
+            emit(app, "error", "DSH 进程已退出", Some(detail));
             return;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    emit(
-        app,
-        "error",
-        "DSH 启动超时",
-        Some("在限定时间内未能就绪，请检查网络后重试。".into()),
-    );
+    let tail = boot_log_tail(app);
+    let detail = if tail.is_empty() {
+        "在限定时间内未能就绪，请检查网络后重试。".to_string()
+    } else {
+        format!("在限定时间内未能就绪。\n\n--- dsh 输出尾部 ---\n{tail}")
+    };
+    emit(app, "error", "DSH 启动超时", Some(detail));
 }
 
 /// Install a portable Node.js (Windows x64 zip) under the app data dir,
@@ -398,16 +492,21 @@ fn run_quick_ask_task(app: AppHandle, task: String) {
 
     let mut cmd = Command::new("cmd");
     cmd.arg("/C");
-    if let Some(dir) = &node_dir {
+    // Prefer a globally installed `dsh` over npx (see spawn_dsh for why).
+    let use_global = find_global_dsh();
+    if use_global {
+        debug_log("quick_ask: using globally installed `dsh`");
+        cmd.arg("dsh");
+    } else if let Some(dir) = &node_dir {
         cmd.arg(dir.join("npx.cmd"));
         let path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{};{}", dir.display(), path));
+        cmd.arg("--yes").arg("@deepseek-ai/dsh");
     } else {
-        cmd.arg("npx");
+        cmd.arg("npx").arg("--yes").arg("@deepseek-ai/dsh");
     }
-    cmd.arg("--yes")
-        .arg("@deepseek-ai/dsh")
-        .arg("--profile")
+    cmd.env("npm_config_allow_scripts", NPM_ALLOW_SCRIPTS);
+    cmd.arg("--profile")
         .arg("headless")
         .arg(&task)
         .stdin(Stdio::null())
@@ -784,6 +883,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState {
             child: Mutex::new(None),
+            boot_log: Arc::new(Mutex::new(String::new())),
             node_dir: Mutex::new(None),
             quick_ask_child: Mutex::new(None),
             quitting: AtomicBool::new(false),

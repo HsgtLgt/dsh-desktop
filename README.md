@@ -7,7 +7,7 @@ DeepSeek Harness (DSH) 的 Windows 桌面客户端。核心原则：**不打包 
 ## ✨ 功能
 
 - **双击 exe 免命令**：自动检测 dsh 服务是否在运行，没运行就自动拉起
-- **自动拉起 dsh**：通过 `npx --yes @deepseek-ai/dsh web --port 3080` 启动（npx 每次自动用最新版 dsh）
+- **自动拉起 dsh**：优先使用已全局安装的 `dsh`（`npm install -g @deepseek-ai/dsh`），未安装时自动回退 `npx --yes @deepseek-ai/dsh web --port 3080`（npx 每次自动用最新版 dsh）
 - **桌面窗口承载界面**：dsh 就绪后，窗口直接加载其 Web UI，无需浏览器标签页
 - **首次启动向导**：检测不到 Node.js 时，可一键安装便携版 Node.js（下载到应用自己的目录，不动系统），或引导手动安装
 - **系统托盘**：关闭窗口最小化到托盘，dsh 服务继续后台运行；托盘菜单可打开主窗口 / 快问 / 开机自启 / 退出
@@ -63,12 +63,26 @@ npm run tauri build      # 打包（产物在 src-tauri/target/release/，安装
 │  ├─ 系统托盘 ── 常驻 + 菜单                 │
 │  └─ 生命周期 ── 拉起/监控/清理 dsh 进程     │
 └────────────────────┬────────────────────────┘
-                     │ npx 拉取 + 健康轮询
+                     │ 全局 dsh / npx 拉取 + 健康轮询
         ┌────────────▼────────────┐
-        │  dsh (@deepseek-ai/dsh) │  ← 永远是 npm 最新版
+        │  dsh (@deepseek-ai/dsh) │  ← 全局安装优先，其次 npm 最新版
         │  http://127.0.0.1:3080  │
         └─────────────────────────┘
 ```
+
+## 🐛 常见问题
+
+### npm 12 下 npx 拉取 dsh 失败（`ECOMPROMISED` / Lock compromised）
+
+npm 12 的 `npx` 存在缓存锁 bug（`libnpmexec/with-lock.js` 在建树超时后自判"锁被污染"直接中止），dsh 依赖树有 500+ 个包，解析建树时间过长时必然踩中；npm 11+/12 还默认不执行依赖的安装脚本（node-pty、koffi 等原生模块会残废）。
+
+解决办法：全局安装一次 dsh，之后壳会直接使用它，不再经过 npx：
+
+```powershell
+npm install -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs @deepseek-ai/dsh
+```
+
+> 提示：壳启动失败时（如"DSH 进程已退出"），错误详情里会附上 dsh 进程输出的尾部，可直接据此定位原因。设置环境变量 `DSH_DESKTOP_LOG_DIR` 可输出完整日志。
 
 ## 📄 许可证
 
