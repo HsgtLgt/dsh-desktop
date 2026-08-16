@@ -20,7 +20,10 @@
         data-tauri-drag-region
       />
       <div id="qa-body" class="qa-body hidden">
-        <div id="qa-status" class="qa-status"></div>
+        <div class="qa-status-row">
+          <span id="qa-status" class="qa-status"></span>
+          <button id="qa-copy" class="qa-copy hidden">复制结果</button>
+        </div>
         <pre id="qa-output" class="qa-output"></pre>
       </div>
       <div id="qa-running" class="qa-running hidden">

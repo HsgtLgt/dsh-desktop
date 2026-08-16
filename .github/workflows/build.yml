@@ -57,6 +57,8 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "DSH Desktop ${{ github.ref_name }}"
@@ -69,7 +71,8 @@ jobs:
             - 双击 exe 免命令启动，自动拉起 dsh 服务
             - 首次启动向导：检测不到 Node.js 时可一键安装便携版
             - 系统托盘常驻 + 开机自启
-            - ⌨️ 快问弹窗（Alt+Space）：随叫随到的单次问答
+            - ⌨️ 快问弹窗（Alt+Space）：随叫随到的单次问答，结果可一键复制
+            - 🔄 自动更新：托盘菜单"检查更新"
             - 系统通知：任务完成/失败提醒
 
             ### 📦 安装

@@ -554,10 +554,81 @@ fn is_autostart(app: AppHandle) -> bool {
 }
 
 #[tauri::command]
+fn get_shortcut(app: AppHandle) -> String {
+    load_shortcut(&app)
+}
+
+#[tauri::command]
+fn set_shortcut(app: AppHandle, shortcut: String) -> Result<String, String> {
+    let shortcut = shortcut.trim().to_string();
+    if shortcut.is_empty() {
+        return Err("快捷键不能为空".into());
+    }
+    // Validate by attempting to register it.
+    let app2 = app.clone();
+    app2.global_shortcut()
+        .register(shortcut.as_str())
+        .map_err(|e| format!("快捷键无效或已被占用：{e}"))?;
+    let _ = app2.global_shortcut().unregister(shortcut.as_str());
+    save_shortcut(&app, &shortcut)?;
+    debug_log(&format!("shortcut saved as {shortcut}"));
+    Ok(shortcut)
+}
+
+#[tauri::command]
 fn quit_app(app: AppHandle) {
     app.state::<AppState>().quitting.store(true, Ordering::SeqCst);
     kill_spawned_child(&app);
     app.exit(0);
+}
+
+fn check_update(app: &AppHandle) {
+    use tauri_plugin_updater::UpdaterExt;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        notify(&app, "检查更新", "正在检查新版本…");
+        let updater = match app.updater() {
+            Ok(u) => u,
+            Err(e) => {
+                notify(&app, "检查更新失败", &format!("{e}"));
+                return;
+            }
+        };
+        match tauri::async_runtime::block_on(updater.check()) {
+            Ok(Some(update)) => {
+                let version = update.version.clone();
+                notify(
+                    &app,
+                    "发现新版本",
+                    &format!("DSH Desktop {version} 可用，正在下载…"),
+                );
+                match tauri::async_runtime::block_on(update.download_and_install(
+                    |_chunk, _total| {},
+                    || {},
+                )) {
+                    Ok(_) => {
+                        notify(&app, "更新完成", "新版本已安装，正在重启…");
+                        // Relaunch ourselves and exit.
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = Command::new(exe).spawn();
+                        }
+                        std::thread::sleep(Duration::from_millis(600));
+                        app.state::<AppState>().quitting.store(true, Ordering::SeqCst);
+                        app.exit(0);
+                    }
+                    Err(e) => {
+                        notify(&app, "更新失败", &format!("下载安装失败：{e}"));
+                    }
+                }
+            }
+            Ok(None) => {
+                notify(&app, "已是最新", "当前已是最新版本。");
+            }
+            Err(e) => {
+                notify(&app, "检查更新失败", &format!("{e}"));
+            }
+        }
+    });
 }
 
 fn toggle_quick_ask(app: &AppHandle) {
@@ -572,15 +643,56 @@ fn toggle_quick_ask(app: &AppHandle) {
     }
 }
 
+fn shortcut_config_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|d| d.join("settings.json"))
+}
+
+fn load_shortcut(app: &AppHandle) -> String {
+    if let Some(path) = shortcut_config_path(app) {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(s) = v.get("quick_ask_shortcut").and_then(|x| x.as_str()) {
+                    if !s.trim().is_empty() {
+                        return s.to_string();
+                    }
+                }
+            }
+        }
+    }
+    QUICK_ASK_SHORTCUT.to_string()
+}
+
+fn save_shortcut(app: &AppHandle, shortcut: &str) -> Result<(), String> {
+    let path = shortcut_config_path(app).ok_or("无法获取配置目录")?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut map = serde_json::Map::new();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(serde_json::Value::Object(existing)) = serde_json::from_str(&content) {
+            map = existing;
+        }
+    }
+    map.insert(
+        "quick_ask_shortcut".into(),
+        serde_json::Value::String(shortcut.to_string()),
+    );
+    std::fs::write(&path, serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap())
+        .map_err(|e| e.to_string())
+}
+
 fn setup_global_shortcut(app: &AppHandle) {
+    let shortcut = load_shortcut(app);
     let app = app.clone();
-    let result = app.global_shortcut().on_shortcut(QUICK_ASK_SHORTCUT, move |app, _shortcut, event| {
+    let result = app.global_shortcut().on_shortcut(shortcut.as_str(), move |app, _shortcut, event| {
         if event.state == ShortcutState::Pressed {
             toggle_quick_ask(app);
         }
     });
     if let Err(e) = result {
-        debug_log(&format!("register {QUICK_ASK_SHORTCUT} failed ({e}), trying fallback"));
+        debug_log(&format!(
+            "register {shortcut} failed ({e}), trying fallback {QUICK_ASK_SHORTCUT_FALLBACK}"
+        ));
         let app2 = app.clone();
         let _ = app2.global_shortcut().on_shortcut(QUICK_ASK_SHORTCUT_FALLBACK, move |app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
@@ -588,7 +700,7 @@ fn setup_global_shortcut(app: &AppHandle) {
             }
         });
     } else {
-        debug_log(&format!("registered global shortcut {QUICK_ASK_SHORTCUT}"));
+        debug_log(&format!("registered global shortcut {shortcut}"));
     }
 }
 
@@ -597,6 +709,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 
     let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
     let quick = MenuItem::with_id(app, "quick", "快问（Alt+Space）", true, None::<&str>)?;
+    let update = MenuItem::with_id(app, "update", "检查更新", true, None::<&str>)?;
     let autostart = CheckMenuItem::with_id(
         app,
         "autostart",
@@ -606,7 +719,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quick, &autostart, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &quick, &update, &autostart, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("dsh-tray")
         .menu(&menu)
@@ -614,6 +727,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => show_main_window(app),
             "quick" => toggle_quick_ask(app),
+            "update" => check_update(app),
             "autostart" => {
                 let enabled = app.autolaunch().is_enabled().unwrap_or(false);
                 if enabled {
@@ -665,6 +779,9 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState {
             child: Mutex::new(None),
             node_dir: Mutex::new(None),
@@ -684,6 +801,8 @@ pub fn run() {
             quick_ask_ready,
             set_autostart,
             is_autostart,
+            get_shortcut,
+            set_shortcut,
             quit_app
         ])
         .on_window_event(|window, event| {

@@ -25,3 +25,7 @@ dist-ssr
 
 # test artifact
 app.pid
+
+# updater signing private key (NEVER commit; public key is in tauri.conf.json)
+keys/updater.key
+keys/*.key

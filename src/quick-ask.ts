@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
 const input = document.getElementById("qa-input") as HTMLInputElement;
 const body = document.getElementById("qa-body") as HTMLElement;
@@ -8,11 +9,13 @@ const statusEl = document.getElementById("qa-status") as HTMLElement;
 const outputEl = document.getElementById("qa-output") as HTMLElement;
 const runningEl = document.getElementById("qa-running") as HTMLElement;
 const runningText = document.getElementById("qa-running-text") as HTMLElement;
+const copyBtn = document.getElementById("qa-copy") as HTMLButtonElement;
 
 const appWindow = getCurrentWebviewWindow();
 
 let busy = false;
 let outputBuf: string[] = [];
+let finalOutput = "";
 
 interface QuickAskEvent {
   kind: "started" | "output" | "done" | "error";
@@ -27,12 +30,27 @@ function submit() {
 
   busy = true;
   outputBuf = [];
+  finalOutput = "";
   outputEl.textContent = "";
+  copyBtn.classList.add("hidden");
   body.classList.remove("hidden");
   runningEl.classList.remove("hidden");
   runningText.textContent = "任务运行中…";
   input.disabled = true;
   void invoke("quick_ask", { task });
+}
+
+async function copyResult() {
+  if (!finalOutput) return;
+  try {
+    await writeText(finalOutput);
+    copyBtn.textContent = "✅ 已复制";
+    setTimeout(() => {
+      copyBtn.textContent = "复制结果";
+    }, 1500);
+  } catch {
+    copyBtn.textContent = "复制失败";
+  }
 }
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -47,6 +65,8 @@ window.addEventListener("DOMContentLoaded", () => {
       runningEl.classList.add("hidden");
       input.disabled = false;
       statusEl.textContent = "✅ 完成";
+      finalOutput = outputBuf.join("");
+      copyBtn.classList.remove("hidden");
       input.value = "";
       input.focus();
     } else if (kind === "error") {
@@ -55,9 +75,15 @@ window.addEventListener("DOMContentLoaded", () => {
       input.disabled = false;
       statusEl.textContent = "❌ 出错";
       outputEl.textContent = text || "未知错误";
+      finalOutput = text || "";
+      copyBtn.classList.remove("hidden");
       input.value = "";
       input.focus();
     }
+  });
+
+  copyBtn.addEventListener("click", () => {
+    void copyResult();
   });
 
   input.addEventListener("keydown", (e) => {
@@ -80,3 +106,4 @@ window.addEventListener("DOMContentLoaded", () => {
 
   void invoke("quick_ask_ready");
 });
+

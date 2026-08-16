@@ -59,6 +59,29 @@ body {
   word-break: break-all;
 }
 
+.qa-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.qa-copy {
+  flex-shrink: 0;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid #3a4152;
+  background: #2a2e38;
+  color: #9aa0ae;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.qa-copy:hover {
+  color: #e8e8e8;
+  border-color: #5d7cff;
+}
+
 .qa-output {
   flex: 1;
   min-height: 0;
