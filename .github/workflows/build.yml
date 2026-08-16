@@ -1,0 +1,68 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build (debug check)
+        if: startsWith(github.ref, 'refs/heads/')
+        run: |
+          npm run build
+          cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Build & bundle (release)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "DSH Desktop ${{ github.ref_name }}"
+          releaseBody: |
+            ## DSH Desktop ${{ github.ref_name }}
+
+            DeepSeek Harness 的 Windows 桌面客户端（Tauri 2 壳）。
+
+            ### ✨ 功能
+            - 双击 exe 免命令启动，自动拉起 dsh 服务
+            - 首次启动向导：检测不到 Node.js 时可一键安装便携版
+            - 系统托盘常驻 + 开机自启
+            - ⌨️ 快问弹窗（Alt+Space）：随叫随到的单次问答
+            - 系统通知：任务完成/失败提醒
+
+            ### 📦 安装
+            下载 `dsh-desktop_${{ github.ref_name }}_x64-setup.exe` 安装即可。
+            安装包不含 dsh 本体，首次启动自动通过 npm 拉取最新版 dsh，永远兼容更新。
+          releaseDraft: true
+          prerelease: false

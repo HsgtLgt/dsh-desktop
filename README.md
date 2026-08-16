@@ -18,7 +18,9 @@ DeepSeek Harness (DSH) 的 Windows 桌面客户端。核心原则：**不打包 
 
 ## 🖥️ 截图
 
-> TODO: 添加截图
+| 主界面 | 快问弹窗（Alt+Space） |
+|---|---|
+| ![主界面](design/screenshot-main.png) | ![快问弹窗](design/screenshot-quickask.png) |
 
 ## 🧩 为什么"永远兼容 dsh 更新"
 
