@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/quick-ask.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DSH 快问</title>
+    <script type="module" src="/src/quick-ask.ts" defer></script>
+  </head>
+
+  <body>
+    <main class="qa" data-tauri-drag-region>
+      <input
+        id="qa-input"
+        class="qa-input"
+        type="text"
+        placeholder="向 DSH 提问，Enter 执行（Esc 关闭）"
+        autocomplete="off"
+        spellcheck="false"
+        data-tauri-drag-region
+      />
+      <div id="qa-body" class="qa-body hidden">
+        <div id="qa-status" class="qa-status"></div>
+        <pre id="qa-output" class="qa-output"></pre>
+      </div>
+      <div id="qa-running" class="qa-running hidden">
+        <span class="qa-spinner"></span>
+        <span id="qa-running-text">任务运行中…</span>
+      </div>
+    </main>
+  </body>
+</html>

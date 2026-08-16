@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DSH Desktop</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <main class="screen">
+      <div class="logo">DSH</div>
+      <h1>DSH Desktop</h1>
+      <p class="subtitle">DeepSeek Harness 桌面版</p>
+
+      <div class="status-card">
+        <div id="status" class="status-text">正在启动…</div>
+        <div id="spinner" class="spinner hidden"></div>
+        <div id="detail" class="detail hidden"></div>
+
+        <!-- Node 缺失时的向导 -->
+        <div id="wizard" class="wizard hidden">
+          <p class="wizard-title">需要安装 Node.js</p>
+          <p class="wizard-hint">
+            DSH 桌面版需要在后台运行一个 Node.js 服务。你可以一键安装便携版
+            Node.js（约 30MB，只装在应用自己的目录里，不动系统），或手动安装。
+          </p>
+          <div class="btn-row">
+            <button id="btn-install" class="btn primary">一键安装便携版 Node.js</button>
+            <button id="btn-guide" class="btn">打开手动安装指引</button>
+          </div>
+        </div>
+
+        <!-- 错误提示 -->
+        <div id="error" class="error hidden">
+          <p id="error-msg" class="error-msg"></p>
+          <div class="btn-row">
+            <button id="btn-retry" class="btn primary">重试</button>
+            <button id="btn-quit" class="btn">退出</button>
+          </div>
+        </div>
+      </div>
+
+      <p class="footer">关闭窗口将最小化到系统托盘，DSH 服务继续在后台运行。</p>
+    </main>
+  </body>
+</html>
