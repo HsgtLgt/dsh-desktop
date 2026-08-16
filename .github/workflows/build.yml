@@ -77,6 +77,6 @@ jobs:
 
             ### 📦 安装
             下载 `dsh-desktop_${{ github.ref_name }}_x64-setup.exe` 安装即可。
-            安装包不含 dsh 本体，首次启动自动通过 npm 拉取最新版 dsh，永远兼容更新。
+            安装包不含 dsh 本体；首次启动优先使用已全局安装的 `dsh`（`npm install -g @deepseek-ai/dsh`），未安装时自动通过 npx 拉取最新版，永远兼容更新。
           releaseDraft: true
           prerelease: false

@@ -706,12 +706,14 @@ fn check_update(app: &AppHandle) {
                     || {},
                 )) {
                     Ok(_) => {
-                        notify(&app, "更新完成", "新版本已安装，正在重启…");
-                        // Relaunch ourselves and exit.
-                        if let Ok(exe) = std::env::current_exe() {
-                            let _ = Command::new(exe).spawn();
-                        }
-                        std::thread::sleep(Duration::from_millis(600));
+                        // On Windows the updater runs the NSIS installer
+                        // (`/UPDATE`, passive mode) and exits this process
+                        // itself inside download_and_install, so this branch
+                        // is effectively unreachable here — the installer
+                        // relaunches the app. For other platforms, exit
+                        // cleanly after killing the spawned dsh child.
+                        debug_log("update: installed, exiting");
+                        kill_spawned_child(&app);
                         app.state::<AppState>().quitting.store(true, Ordering::SeqCst);
                         app.exit(0);
                     }

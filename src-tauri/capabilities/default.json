@@ -1,17 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
+  "description": "Permissions for the local shell pages (splash + quick-ask). The remote dsh Web UI (http://127.0.0.1:3080) gets no Tauri permissions: no `remote` field is configured, so its plugin and custom commands are all denied by the ACL.",
   "windows": ["main", "quick-ask"],
   "permissions": [
     "core:default",
-    "opener:default",
-    "notification:default",
-    "global-shortcut:allow-register",
-    "global-shortcut:allow-unregister",
-    "global-shortcut:allow-is-registered",
-    "autostart:allow-enable",
-    "autostart:allow-disable",
-    "autostart:allow-is-enabled"
+    "opener:allow-open-url",
+    "clipboard-manager:allow-write-text"
   ]
 }
