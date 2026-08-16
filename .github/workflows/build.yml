@@ -38,6 +38,14 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Bump build script timestamp (force icon embed)
+        run: |
+          # tauri-build caches the embedded icon resource; touching build.rs
+          # forces cargo to re-run it so the custom icon lands in the exe.
+          $f = Get-Item src-tauri/build.rs
+          $f.LastWriteTime = Get-Date
+          Write-Host "build.rs bumped to $($f.LastWriteTime)"
+
       - name: Build (debug check)
         if: startsWith(github.ref, 'refs/heads/')
         run: |
