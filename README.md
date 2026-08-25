@@ -2,88 +2,106 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-DeepSeek Harness (DSH) 的 Windows 桌面客户端。核心原则：**不打包 dsh 本体、永远兼容 dsh 更新**。
+DeepSeek Harness (DSH) 的 Windows 桌面客户端。
 
-## ✨ 功能
+核心原则：
 
-- **双击 exe 免命令**：自动检测 dsh 服务是否在运行，没运行就自动拉起
-- **自动拉起 dsh**：优先使用已全局安装的 `dsh`（`npm install -g @deepseek-ai/dsh`），未安装时自动回退 `npx --yes @deepseek-ai/dsh web --port 3080`（npx 每次自动用最新版 dsh）
-- **桌面窗口承载界面**：dsh 就绪后，窗口直接加载其 Web UI，无需浏览器标签页
-- **首次启动向导**：检测不到 Node.js 时，可一键安装便携版 Node.js（下载到应用自己的目录，不动系统），或引导手动安装
-- **系统托盘**：关闭窗口最小化到托盘，dsh 服务继续后台运行；托盘菜单可打开主窗口 / 快问 / 开机自启 / 退出
-- **系统通知**：快问任务完成或失败时发送系统通知
-- **⌨️ 快问弹窗（Alt+Space）**：任何界面下按 `Alt+Space` 弹出小输入框，输入任务回车即后台执行（走 dsh headless 单次问答），结果实时回流，完成弹通知——像 Raycast/Listary 一样随叫随到
-- **📋 结果一键复制**：快问结果区一键复制带走
-- **🔄 自动更新**：托盘菜单"检查更新"，自动下载安装最新版并重启（基于 Tauri updater，签名密钥免费生成）
-- **开机自启**：托盘菜单一键开启，开机后台常驻
-- **⌨️ 快捷键可配置**：Alt+Space 被占用时可自定义（配置存于应用配置目录 `settings.json`）
-- **单实例**：重复双击 exe 只会聚焦已有窗口，不会起第二个 dsh
+- **不打包 dsh 本体 / Web UI**（界面仍是 dsh 自己的 Web UI）
+- **钉死本地运行时**：私有 Node + 私有 npm prefix 中的 `@deepseek-ai/dsh`
+- **稳定可开 + 手动升级**（启动热路径 **禁止 npx**）
+- **开机自启 = 完全静默托盘**（失败只写诊断 / 通知，不弹致命窗）
 
-## 🖥️ 截图
+## 功能（v1）
 
-| 主界面 | 快问弹窗（Alt+Space） |
-|---|---|
-| ![主界面](design/screenshot-main.png) | ![快问弹窗](design/screenshot-quickask.png) |
+- 双击 exe：检测已有服务 → 否则用钉死路径启动 `dsh web --no-open`
+- 首次运行向导：安装便携 Node，并把 dsh 装到 `%LOCALAPPDATA%/dsh-desktop/runtime/`
+- 系统托盘：打开主窗口 / 升级 DSH / 检查壳更新 / 诊断 / 开机自启 / 退出
+- 开机自启：带 `--minimized`，仅托盘，短延迟后再拉服务
+- 壳自动更新：Tauri updater（与 dsh 版本解耦）
 
-## 🧩 为什么"永远兼容 dsh 更新"
+## 明确不做（v1）
 
-壳从不复制 dsh 的界面或逻辑——界面是 dsh 自己吐出来的 Web UI，壳只是把它放进一个原生窗口。
-dsh 更新 → 下次启动 `npx` 自动用新版 → 壳照常工作。**dsh 本体从不进入 exe 安装包**。
+- 启动时 `npx` 拉最新
+- 另起 `dsh --profile headless` 的「快问」
+- 自研替换 dsh Web UI
 
-## 🚀 快速开始（用户）
+## 为什么「永远兼容」但不「每次最新」
 
-1. 下载最新 [Release](https://github.com/HsgtLgt/dsh-desktop/releases) 中的 exe
-2. 双击运行即可
-3. （可选）托盘菜单勾选"开机自启"
+壳从不复制 dsh 界面。dsh 升级由托盘 **「升级 DSH（手动）」** 触发，装进同一私有 prefix 后重启服务。  
+下次冷启动仍走同一绝对路径，不依赖登录态 PATH，也不走 npx。
 
-## 🛠️ 开发
+## 用户使用
 
-环境要求：Windows 10/11、[Node.js](https://nodejs.org)、[Rust](https://rustup.rs)
+1. 下载 Release 中的安装包 / exe
+2. 双击运行；若提示需要运行时，点「一键安装运行时」
+3. （可选）托盘勾选「开机自启（静默托盘）」
+
+## 数据目录
+
+```
+%LOCALAPPDATA%/dsh-desktop/
+  settings.json          # 钉死的 nodeExe / dshPath / 版本等
+  runtime/
+    node/                # 便携 Node
+    npm-prefix/          # npm global prefix（dsh.cmd 在此）
+  logs/boot-YYYYMMDD.log
+  state/last-error.json  # 自启失败摘要
+```
+
+## 开发
+
+环境：Windows 10/11、Node.js、Rust
 
 ```bash
 npm install
-npm run tauri dev        # 开发模式
-npm run tauri build      # 打包（产物在 src-tauri/target/release/，安装器在 target/release/bundle/）
+npm run tauri dev
+npm run tauri build
 ```
 
-### 环境变量（调试用）
+### 调试环境变量
 
 | 变量 | 作用 |
 |---|---|
-| `DSH_DESKTOP_PORT` | 覆盖 dsh 服务端口（默认 3080） |
-| `DSH_DESKTOP_LOG_DIR` | 开启文件日志，输出到指定目录 |
+| `DSH_DESKTOP_PORT` | 覆盖端口（默认 3080，不写入 settings） |
+| `DSH_DESKTOP_LOG_DIR` | 额外文件日志目录 |
 
-## 🏗️ 架构
+### 自启调试
+
+```bash
+# 模拟开机静默
+dsh-desktop.exe --minimized
+```
+
+## 架构
 
 ```
 ┌─────────────────────────────────────────────┐
-│  DSH Desktop (Tauri 2, Rust)                │
-│  ├─ 主窗口 ── 加载 dsh 的 Web UI            │
-│  ├─ 快问弹窗 ── 独立小窗，headless 问答      │
-│  ├─ 系统托盘 ── 常驻 + 菜单                 │
-│  └─ 生命周期 ── 拉起/监控/清理 dsh 进程     │
+│  DSH Desktop (Tauri 2)                      │
+│  settings 绝对路径 → spawn 钉死 dsh         │
+│  健康检查：TCP + HTTP 状态（不嗅 doctype）   │
+│  自启：--minimized → 仅托盘                 │
 └────────────────────┬────────────────────────┘
-                     │ 全局 dsh / npx 拉取 + 健康轮询
+                     │
         ┌────────────▼────────────┐
-        │  dsh (@deepseek-ai/dsh) │  ← 全局安装优先，其次 npm 最新版
+        │  dsh（私有 npm-prefix） │
         │  http://127.0.0.1:3080  │
         └─────────────────────────┘
 ```
 
-## 🐛 常见问题
+## 常见问题
 
-### npm 12 下 npx 拉取 dsh 失败（`ECOMPROMISED` / Lock compromised）
+### 开机自启没有窗口 / 只有托盘
 
-npm 12 的 `npx` 存在缓存锁 bug（`libnpmexec/with-lock.js` 在建树超时后自判"锁被污染"直接中止），dsh 依赖树有 500+ 个包，解析建树时间过长时必然踩中；npm 11+/12 还默认不执行依赖的安装脚本（node-pty、koffi 等原生模块会残废）。
+这是预期行为。点托盘图标打开主窗口。若服务未起来，托盘通知 + `state/last-error.json`。
 
-解决办法：全局安装一次 dsh，之后壳会直接使用它，不再经过 npx：
+### 以前依赖全局 `npm install -g` / npx
 
-```powershell
-npm install -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs @deepseek-ai/dsh
-```
+v1 改为应用目录钉死。请打开一次应用走安装向导；或托盘「升级 DSH」写入私有 prefix。
 
-> 提示：壳启动失败时（如"DSH 进程已退出"），错误详情里会附上 dsh 进程输出的尾部，可直接据此定位原因。设置环境变量 `DSH_DESKTOP_LOG_DIR` 可输出完整日志。
+### npm 安装 dsh 需要原生模块脚本
 
-## 📄 许可证
+安装/升级时会传入 allow-scripts 列表（node-pty、koffi 等）。若仍失败，打开诊断页查看输出尾部。
+
+## 许可证
 
 [MIT](LICENSE) © 2026 蒙 寸尘 (HsgtLgt)

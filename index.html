@@ -12,27 +12,26 @@
     <main class="screen">
       <div class="logo">DSH</div>
       <h1>DSH Desktop</h1>
-      <p class="subtitle">DeepSeek Harness 桌面版</p>
+      <p class="subtitle">DeepSeek Harness 桌面版 · 钉死运行时</p>
 
       <div class="status-card">
         <div id="status" class="status-text">正在启动…</div>
         <div id="spinner" class="spinner hidden"></div>
         <div id="detail" class="detail hidden"></div>
 
-        <!-- Node 缺失时的向导 -->
         <div id="wizard" class="wizard hidden">
-          <p class="wizard-title">需要安装 Node.js</p>
+          <p class="wizard-title">需要安装本地运行时</p>
           <p class="wizard-hint">
-            DSH 桌面版需要在后台运行一个 Node.js 服务。你可以一键安装便携版
-            Node.js（约 30MB，只装在应用自己的目录里，不动系统），或手动安装。
+            将安装便携版 Node.js，并把 DeepSeek Harness
+            <strong>钉死</strong>到应用目录。之后启动不再走 npx，升级请用托盘「升级
+            DSH」。
           </p>
           <div class="btn-row">
-            <button id="btn-install" class="btn primary">一键安装便携版 Node.js</button>
-            <button id="btn-guide" class="btn">打开手动安装指引</button>
+            <button id="btn-install" class="btn primary">一键安装运行时</button>
+            <button id="btn-guide" class="btn">打开 Node.js 官网</button>
           </div>
         </div>
 
-        <!-- 错误提示 -->
         <div id="error" class="error hidden">
           <p id="error-msg" class="error-msg"></p>
           <div class="btn-row">
@@ -42,7 +41,9 @@
         </div>
       </div>
 
-      <p class="footer">关闭窗口将最小化到系统托盘，DSH 服务继续在后台运行。</p>
+      <p class="footer">
+        关闭窗口将最小化到托盘。开机自启为静默托盘，失败不会弹致命窗口。
+      </p>
     </main>
   </body>
 </html>

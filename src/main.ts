@@ -19,21 +19,48 @@ const installBtn = document.getElementById("btn-install") as HTMLButtonElement;
 function setStage(stage: string, message: string, detail?: string | null) {
   statusEl.textContent = message;
 
-  const busy = ["detecting", "starting", "installing", "installed"].includes(stage);
+  const busy = ["detecting", "starting", "installing", "installed"].includes(
+    stage,
+  );
   spinnerEl.classList.toggle("hidden", !busy);
 
-  wizardEl.classList.toggle("hidden", stage !== "need-node");
-  errorEl.classList.toggle("hidden", stage !== "error");
+  const needRuntime = stage === "need-runtime" || stage === "need-node";
+  wizardEl.classList.toggle("hidden", !needRuntime);
+  const showError = stage === "error" || stage === "error-silent";
+  errorEl.classList.toggle("hidden", !showError);
   detailEl.classList.toggle("hidden", !detail);
 
   if (detail) {
     detailEl.textContent = detail;
   }
-  if (stage === "error" && detail) {
+  if (showError && detail) {
     errorMsgEl.textContent = detail;
   }
-  if (stage === "need-node") {
+  if (needRuntime) {
     installBtn.disabled = false;
+  }
+}
+
+async function syncBootStatus() {
+  try {
+    const status = await invoke<BootEvent | null>("get_boot_status");
+    if (status?.stage) {
+      setStage(status.stage, status.message, status.detail ?? null);
+      return;
+    }
+  } catch (e) {
+    console.debug("get_boot_status", e);
+  }
+
+  // No cached status yet (boot still racing) — wait briefly and retry once.
+  await new Promise((r) => setTimeout(r, 300));
+  try {
+    const status = await invoke<BootEvent | null>("get_boot_status");
+    if (status?.stage) {
+      setStage(status.stage, status.message, status.detail ?? null);
+    }
+  } catch {
+    /* ignore */
   }
 }
 
@@ -45,9 +72,9 @@ window.addEventListener("DOMContentLoaded", () => {
 
   document.getElementById("btn-install")?.addEventListener("click", () => {
     installBtn.disabled = true;
-    statusEl.textContent = "正在准备便携版 Node.js…";
+    statusEl.textContent = "正在安装运行时…";
     spinnerEl.classList.remove("hidden");
-    void invoke("install_node");
+    void invoke("install_runtime_cmd");
   });
 
   document.getElementById("btn-guide")?.addEventListener("click", () => {
@@ -62,6 +89,5 @@ window.addEventListener("DOMContentLoaded", () => {
     void invoke("quit_app");
   });
 
-  // 启动引导流程
-  void invoke("start_boot");
+  void syncBootStatus();
 });

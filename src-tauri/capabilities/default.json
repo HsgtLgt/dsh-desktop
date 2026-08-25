@@ -6,6 +6,10 @@
   "permissions": [
     "core:default",
     "opener:allow-open-url",
-    "clipboard-manager:allow-write-text"
+    "clipboard-manager:allow-write-text",
+    "notification:default",
+    "autostart:default",
+    "updater:default",
+    "process:default"
   ]
 }

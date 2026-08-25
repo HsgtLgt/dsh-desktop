@@ -1,7 +1,10 @@
+mod install;
+mod paths;
+mod probe;
+mod settings;
+
 use std::{
-    io::{BufRead, BufReader, Read, Write},
-    net::TcpStream,
-    path::{Path, PathBuf},
+    io::Read,
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -12,49 +15,34 @@ use std::{
 
 use serde::Serialize;
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, Url, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_notification::NotificationExt;
 
-const DEFAULT_PORT: u16 = 3080;
-const BOOT_TIMEOUT: Duration = Duration::from_secs(240);
-const QUICK_ASK_SHORTCUT: &str = "Alt+Space";
-const QUICK_ASK_SHORTCUT_FALLBACK: &str = "Alt+Shift+Space";
-/// Capped size of the shared boot-process output buffer.
+use install::{install_runtime, recover_from_disk, upgrade_dsh, NPM_ALLOW_SCRIPTS};
+use paths::AppPaths;
+use probe::probe;
+use settings::Settings;
+
 const MAX_BOOT_LOG: usize = 8192;
-/// npm 11+/12 refuses to run dependency install scripts by default. dsh's
-/// terminal stack (node-pty, koffi) needs its postinstall scripts, so pass
-/// the allow-list through to npx's underlying install. Ignored by older npm.
-const NPM_ALLOW_SCRIPTS: &str =
-    "@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs";
-const NODE_SETUP_PS1: &str = r#"$ErrorActionPreference = 'Stop'
-$idx = curl.exe -sL --fail 'https://nodejs.org/dist/index.json'
-$json = $idx | ConvertFrom-Json
-$lts = $json | Where-Object { $_.lts -ne $false } | Select-Object -First 1
-$ver = $lts.version
-$url = 'https://nodejs.org/dist/' + $ver + '/node-' + $ver + '-win-x64.zip'
-$zip = '__NODE_ROOT__/node.zip'
-curl.exe -sL --fail -o $zip $url
-tar.exe -xf $zip -C '__NODE_ROOT__'
-if ($LASTEXITCODE -ne 0) { throw '解压 Node.js 失败' }
-Remove-Item $zip -Force
-"#;
+const MAX_AUTO_RESTART: u8 = 2;
+const AUTOSTART_DELAY: Duration = Duration::from_secs(5);
 
 struct AppState {
-    /// The dsh child process we spawned (None if we connected to an existing one).
     child: Mutex<Option<Child>>,
-    /// Shared capped buffer of the boot process's stdout+stderr, so failures
-    /// (e.g. npx errors) can be surfaced to the user instead of a bare exit code.
     boot_log: Arc<Mutex<String>>,
-    /// Directory of a portable Node.js we installed ourselves.
-    node_dir: Mutex<Option<PathBuf>>,
-    /// The running quick-ask headless task, if any.
-    quick_ask_child: Mutex<Option<Child>>,
+    settings: Mutex<Settings>,
+    paths: Mutex<Option<AppPaths>>,
+    splash_url: Mutex<Option<Url>>,
+    /// Last boot-status event — frontend may miss live emits during splash load.
+    last_boot: Mutex<Option<BootEvent>>,
+    silent: AtomicBool,
+    booting: AtomicBool,
     quitting: AtomicBool,
+    restart_count: Mutex<u8>,
 }
 
 #[derive(Clone, Serialize)]
@@ -65,69 +53,105 @@ struct BootEvent {
     detail: Option<String>,
 }
 
-fn emit(app: &AppHandle, stage: &str, message: &str, detail: Option<String>) {
-    let _ = app.emit(
-        "boot-status",
-        BootEvent {
-            stage: stage.into(),
-            message: message.into(),
-            detail,
-        },
-    );
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LastError {
+    at: String,
+    stage: String,
+    message: String,
+    detail: Option<String>,
 }
 
-fn port() -> u16 {
+fn emit(app: &AppHandle, stage: &str, message: &str, detail: Option<String>) {
+    let event = BootEvent {
+        stage: stage.into(),
+        message: message.into(),
+        detail,
+    };
+    if let Ok(mut guard) = app.state::<AppState>().last_boot.lock() {
+        *guard = Some(event.clone());
+    }
+    debug_log(&format!("boot-status: {} — {}", event.stage, event.message));
+    let _ = app.emit("boot-status", event);
+}
+
+fn debug_log(msg: &str) {
+    if let Some(dir) = std::env::var_os("DSH_DESKTOP_LOG_DIR") {
+        let path = std::path::Path::new(&dir).join("dsh-desktop.log");
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+    // Also append to app boot log file when paths known — best-effort via env only here.
+    eprintln!("[dsh-desktop] {msg}");
+}
+
+fn append_boot_file(app: &AppHandle, msg: &str) {
+    let paths = {
+        let state = app.state::<AppState>();
+        let guard = state.paths.lock().unwrap();
+        guard.clone()
+    };
+    let Some(paths) = paths else {
+        return;
+    };
+    let path = paths.boot_log_file();
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+fn write_last_error(app: &AppHandle, stage: &str, message: &str, detail: Option<String>) {
+    let paths = {
+        let state = app.state::<AppState>();
+        let guard = state.paths.lock().unwrap();
+        guard.clone()
+    };
+    let Some(paths) = paths else {
+        return;
+    };
+    let err = LastError {
+        at: format!("{:?}", std::time::SystemTime::now()),
+        stage: stage.into(),
+        message: message.into(),
+        detail,
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&err) {
+        let _ = std::fs::write(paths.last_error_file(), json);
+    }
+}
+
+fn notify(app: &AppHandle, title: &str, body: &str) {
+    let _ = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show();
+    debug_log(&format!("notification: {title} - {body}"));
+}
+
+fn is_minimized_arg() -> bool {
+    std::env::args().any(|a| a == "--minimized" || a == "-minimized")
+}
+
+fn effective_port(settings: &Settings) -> u16 {
     std::env::var("DSH_DESKTOP_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_PORT)
+        .unwrap_or(settings.port)
 }
 
-/// Minimal HTTP probe: returns true if a page answering with `<!doctype` is
-/// served on 127.0.0.1:port. That's the dsh web UI.
-fn probe(port: u16) -> bool {
-    let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
-        return false;
-    };
-    let _ = s.set_read_timeout(Some(Duration::from_millis(1200)));
-    let _ = s.set_write_timeout(Some(Duration::from_millis(1200)));
-    if s.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
-        return false;
-    }
-    let mut buf = [0u8; 512];
-    let Ok(n) = s.read(&mut buf) else {
-        return false;
-    };
-    let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
-    head.contains(" 200 ") && head.contains("<!doctype")
-}
-
-fn system_node_version() -> Option<String> {
-    let out = Command::new("node").arg("--version").output().ok()?;
-    if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        None
-    }
-}
-
-/// True when a `dsh` executable is resolvable on PATH (a global npm install).
-/// Preferring it over npx sidesteps npm 12's broken npx cache-lock
-/// (ECOMPROMISED) and its default block on dependency install scripts.
-fn find_global_dsh() -> bool {
-    let probe = if cfg!(windows) { "where" } else { "which" };
-    Command::new(probe)
-        .arg("dsh")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Drain a child's stdout/stderr into the shared boot log (capped), so the
-/// pipe can never fill up and stall the server, and the tail stays available
-/// for error reporting.
 fn tee_into_log<R: Read + Send + 'static>(mut reader: R, log: Arc<Mutex<String>>) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -136,9 +160,6 @@ fn tee_into_log<R: Read + Send + 'static>(mut reader: R, log: Arc<Mutex<String>>
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let s = String::from_utf8_lossy(&buf[..n]).to_string();
-                    if std::env::var_os("DSH_DESKTOP_LOG_DIR").is_some() {
-                        debug_log(&format!("[dsh] {s}"));
-                    }
                     let mut log = log.lock().unwrap();
                     log.push_str(&s);
                     if log.len() > MAX_BOOT_LOG {
@@ -151,7 +172,6 @@ fn tee_into_log<R: Read + Send + 'static>(mut reader: R, log: Arc<Mutex<String>>
     });
 }
 
-/// Last ~1500 chars of the boot process output, for error details.
 fn boot_log_tail(app: &AppHandle) -> String {
     let state = app.state::<AppState>();
     let log = state.boot_log.lock().unwrap();
@@ -166,54 +186,92 @@ fn boot_log_tail(app: &AppHandle) -> String {
         .collect()
 }
 
-/// Spawn the dsh web server (`dsh web --port <port>`).
-///
-/// Launcher order:
-/// 1. A globally installed `dsh` on PATH — bypasses npx entirely, which
-///    avoids npm 12's broken npx cache-lock (ECOMPROMISED) and its default
-///    refusal to run dependency install scripts (node-pty/koffi need them).
-/// 2. `npx --yes @deepseek-ai/dsh` — either the portable Node's npx
-///    (`node_dir`) or the system npx.
-fn spawn_dsh(
-    node_dir: Option<&Path>,
-    port: u16,
-    boot_log: Arc<Mutex<String>>,
-) -> std::io::Result<Child> {
-    let mut cmd = Command::new("cmd");
-    cmd.arg("/C");
-    let use_global = find_global_dsh();
-    if use_global {
-        debug_log("spawn_dsh: using globally installed `dsh`");
-        cmd.arg("dsh");
-    } else if let Some(dir) = node_dir {
-        debug_log("spawn_dsh: using portable npx");
-        cmd.arg(dir.join("npx.cmd"));
-        let path = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{};{}", dir.display(), path));
-        cmd.arg("--yes").arg("@deepseek-ai/dsh");
-    } else {
-        debug_log("spawn_dsh: using system npx");
-        cmd.arg("npx").arg("--yes").arg("@deepseek-ai/dsh");
+fn load_or_recover_settings(app: &AppHandle) -> Result<(AppPaths, Settings), String> {
+    debug_log("load_or_recover: begin");
+    let paths = AppPaths::from_app(app)?;
+    debug_log(&format!("load_or_recover: root={}", paths.root.display()));
+    paths.ensure()?;
+    let mut settings = Settings::load(&paths.settings_file());
+
+    if !settings.runtime_ready() {
+        if let Some((node_exe, dsh_path, ver)) = recover_from_disk(&paths) {
+            settings.node_exe = Some(node_exe.display().to_string());
+            settings.dsh_path = Some(dsh_path.display().to_string());
+            settings.dsh_version = ver;
+            let _ = settings.save(&paths.settings_file());
+            debug_log("recovered runtime paths from disk into settings.json");
+        }
     }
-    // npm 11+/12 blocks dependency install scripts by default; let npx's
-    // underlying install still run dsh's required native-module scripts.
-    // Ignored silently by older npm versions.
+
+    debug_log(&format!(
+        "load_or_recover: runtime_ready={}",
+        settings.runtime_ready()
+    ));
+    Ok((paths, settings))
+}
+
+fn persist_settings(app: &AppHandle, settings: &Settings) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let paths = state
+        .paths
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "paths 未初始化".to_string())?;
+    settings.save(&paths.settings_file())?;
+    *state.settings.lock().unwrap() = settings.clone();
+    Ok(())
+}
+
+/// Spawn pinned dsh web. Never uses npx on the production hot path.
+fn spawn_dsh(settings: &Settings, boot_log: Arc<Mutex<String>>) -> std::io::Result<Child> {
+    let port = effective_port(settings);
+    let node_exe = settings
+        .node_exe_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing nodeExe"))?;
+    let dsh_path = settings
+        .dsh_path_buf()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing dshPath"))?;
+    let node_dir = node_exe.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "nodeExe has no parent")
+    })?;
+
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/C").arg(&dsh_path).arg("web").arg("--port").arg(port.to_string());
+    // Prefer --no-open so the shell owns the window.
+    cmd.arg("--no-open");
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    // npm-prefix (parent of dsh.cmd) + node dir first
+    let prefix = dsh_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    cmd.env(
+        "PATH",
+        format!("{};{};{}", node_dir.display(), prefix, path),
+    );
+    // Stable cwd: user's profile — avoids System32 when launched from autostart
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        cmd.current_dir(home);
+    }
     cmd.env("npm_config_allow_scripts", NPM_ALLOW_SCRIPTS);
-    cmd.arg("web")
-        .arg("--port")
-        .arg(port.to_string())
-        .stdin(Stdio::null());
-    // Capture stdout/stderr into the boot log (drained by tee threads, so the
-    // pipe can never fill up). Previously they were discarded, leaving only a
-    // bare "进程已退出" with no diagnostics.
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW: don't flash a console window.
         cmd.creation_flags(0x08000000);
     }
+
+    debug_log(&format!(
+        "spawn_dsh: {} web --port {port} --no-open (node={})",
+        dsh_path.display(),
+        node_exe.display()
+    ));
+
     let mut child = cmd.spawn()?;
     if let Some(out) = child.stdout.take() {
         tee_into_log(out, boot_log.clone());
@@ -222,26 +280,6 @@ fn spawn_dsh(
         tee_into_log(err, boot_log);
     }
     Ok(child)
-}
-
-fn debug_log(msg: &str) {
-    if let Some(dir) = std::env::var_os("DSH_DESKTOP_LOG_DIR") {
-        let path = std::path::Path::new(&dir).join("dsh-desktop.log");
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{}", msg);
-        }
-    }
-    eprintln!("[dsh-desktop] {msg}");
-}
-
-fn navigate_to_dsh(app: &AppHandle) {
-    let p = port();
-    let url = format!("http://127.0.0.1:{p}");
-    if let Some(w) = app.get_webview_window("main") {
-        let res = w.navigate(Url::parse(&url).expect("valid URL"));
-        debug_log(&format!("navigate to {url}: {:?}", res.map(|_| "ok")));
-    }
 }
 
 fn kill_spawned_child(app: &AppHandle) {
@@ -253,7 +291,6 @@ fn kill_spawned_child(app: &AppHandle) {
     if let Some(mut child) = child {
         #[cfg(windows)]
         {
-            // taskkill /T kills the process tree (cmd -> npx -> node).
             let _ = Command::new("taskkill")
                 .args(["/PID", &child.id().to_string(), "/T", "/F"])
                 .status();
@@ -263,63 +300,134 @@ fn kill_spawned_child(app: &AppHandle) {
     }
 }
 
-/// Boot flow, run on a background thread so the UI can show progress.
+fn navigate_to_dsh(app: &AppHandle, port: u16) {
+    let url = format!("http://127.0.0.1:{port}");
+    if let Some(w) = app.get_webview_window("main") {
+        let res = w.navigate(Url::parse(&url).expect("valid URL"));
+        debug_log(&format!("navigate to {url}: {:?}", res.map(|_| "ok")));
+    }
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+fn hide_main_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+}
+
+fn fail(app: &AppHandle, silent: bool, stage: &str, message: &str, detail: Option<String>) {
+    write_last_error(app, stage, message, detail.clone());
+    append_boot_file(app, &format!("FAIL [{stage}] {message} {:?}", detail));
+    if silent {
+        notify(app, "DSH Desktop", message);
+        // Do not emit error UI stages that would demand a modal — still emit for diagnostics page if opened later
+        emit(app, "error-silent", message, detail);
+    } else {
+        emit(app, "error", message, detail);
+    }
+}
+
 fn boot(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if state.booting.swap(true, Ordering::SeqCst) {
+        debug_log("boot: already in progress, skip");
+        return;
+    }
     std::thread::spawn(move || {
-        let p = port();
-        debug_log(&format!("boot: detecting dsh on port {p}"));
-        emit(&app, "detecting", "正在检测 DSH 服务…", None);
-
-        if probe(p) {
-            debug_log("boot: dsh already running, navigating");
-            emit(&app, "ready", "DSH 已在运行，正在打开…", None);
-            navigate_to_dsh(&app);
-            return;
-        }
-        debug_log("boot: dsh not running, checking node");
-
-        let state = app.state::<AppState>();
-        let node_dir = state.node_dir.lock().unwrap().clone();
-
-        match (node_dir, system_node_version()) {
-            (Some(dir), _) => {
-                emit(&app, "starting", "正在使用内置 Node.js 启动 DSH…", None);
-                start_dsh(&app, Some(&dir));
-            }
-            (None, Some(ver)) => {
-                emit(
-                    &app,
-                    "starting",
-                    &format!("检测到 Node.js {ver}，正在启动 DSH…"),
-                    None,
-                );
-                start_dsh(&app, None);
-            }
-            (None, None) => {
-                emit(
-                    &app,
-                    "need-node",
-                    "未检测到 Node.js 运行时",
-                    Some("DSH 桌面版需要 Node.js 才能启动服务。你可以一键安装便携版，或手动安装。".into()),
-                );
-            }
+        let silent = app.state::<AppState>().silent.load(Ordering::SeqCst);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            boot_inner(&app, silent);
+        }));
+        app.state::<AppState>()
+            .booting
+            .store(false, Ordering::SeqCst);
+        if result.is_err() {
+            fail(
+                &app,
+                silent,
+                "panic",
+                "启动过程发生内部错误",
+                Some("详见日志".into()),
+            );
         }
     });
 }
 
-fn start_dsh(app: &AppHandle, node_dir: Option<&Path>) {
-    let p = port();
-    debug_log(&format!(
-        "start_dsh: spawning dsh web on port {p} (node_dir={:?})",
-        node_dir.map(|d| d.display().to_string())
-    ));
+fn boot_inner(app: &AppHandle, silent: bool) {
+    debug_log(&format!("boot_inner: silent={silent}"));
+    if silent {
+        std::thread::sleep(AUTOSTART_DELAY);
+    }
+
+    let (paths, settings) = match load_or_recover_settings(app) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(app, silent, "resolving", "初始化应用目录失败", Some(e));
+            return;
+        }
+    };
+    *app.state::<AppState>().paths.lock().unwrap() = Some(paths.clone());
+    *app.state::<AppState>().settings.lock().unwrap() = settings.clone();
+
+    let port = effective_port(&settings);
+    emit(app, "detecting", "正在检测 DSH 服务…", None);
+
+    if probe(port) {
+        debug_log("boot: existing healthy service on port");
+        emit(app, "ready", "DSH 已在运行，正在打开…", None);
+        navigate_to_dsh(app, port);
+        if !silent {
+            show_main_window(app);
+        }
+        return;
+    }
+
+    if !settings.runtime_ready() {
+        if silent {
+            fail(
+                app,
+                true,
+                "need-install",
+                "运行时未就绪，请手动打开一次完成安装",
+                Some("开机自启不会弹出安装向导。".into()),
+            );
+            return;
+        }
+        emit(
+            app,
+            "need-runtime",
+            "需要安装本地运行时",
+            Some("将安装便携版 Node.js，并把 DeepSeek Harness 钉死到应用目录（不走 npx）。".into()),
+        );
+        return;
+    }
+
+    emit(app, "starting", "正在启动 DSH…", None);
+    start_dsh_and_wait(app, &settings, silent);
+}
+
+fn start_dsh_and_wait(app: &AppHandle, settings: &Settings, silent: bool) {
+    let port = effective_port(settings);
     let boot_log = app.state::<AppState>().boot_log.clone();
-    let child = match spawn_dsh(node_dir, p, boot_log) {
+    {
+        let mut log = boot_log.lock().unwrap();
+        log.clear();
+    }
+
+    let child = match spawn_dsh(settings, boot_log) {
         Ok(c) => c,
         Err(e) => {
-            emit(
+            fail(
                 app,
-                "error",
+                silent,
+                "spawning",
                 "启动 DSH 失败",
                 Some(format!("无法启动进程：{e}")),
             );
@@ -328,15 +436,21 @@ fn start_dsh(app: &AppHandle, node_dir: Option<&Path>) {
     };
     *app.state::<AppState>().child.lock().unwrap() = Some(child);
 
-    let deadline = Instant::now() + BOOT_TIMEOUT;
+    let timeout = Duration::from_millis(settings.probe_timeout_ms);
+    let interval = Duration::from_millis(settings.probe_interval_ms.max(200));
+    let deadline = Instant::now() + timeout;
+
     while Instant::now() < deadline {
-        if probe(p) {
-            debug_log("start_dsh: dsh is ready");
-            emit(app, "ready", "DSH 已就绪，正在打开…", None);
-            navigate_to_dsh(app);
+        if probe(port) {
+            debug_log("start_dsh: ready");
+            *app.state::<AppState>().restart_count.lock().unwrap() = 0;
+            emit(app, "ready", "DSH 已就绪", None);
+            navigate_to_dsh(app, port);
+            if !silent {
+                show_main_window(app);
+            }
             return;
         }
-        // If our child died, report it (with the captured output tail).
         let died = app
             .state::<AppState>()
             .child
@@ -351,341 +465,147 @@ fn start_dsh(app: &AppHandle, node_dir: Option<&Path>) {
             } else {
                 format!("退出码：{status}\n\n--- dsh 输出尾部 ---\n{tail}")
             };
-            emit(app, "error", "DSH 进程已退出", Some(detail));
+            // Limited auto-restart after Ready is handled elsewhere; here it's first boot.
+            fail(app, silent, "exited", "DSH 进程已退出", Some(detail));
             return;
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(interval);
     }
+
     let tail = boot_log_tail(app);
     let detail = if tail.is_empty() {
-        "在限定时间内未能就绪，请检查网络后重试。".to_string()
+        "在限定时间内未能就绪。".to_string()
     } else {
         format!("在限定时间内未能就绪。\n\n--- dsh 输出尾部 ---\n{tail}")
     };
-    emit(app, "error", "DSH 启动超时", Some(detail));
+    fail(app, silent, "timeout", "DSH 启动超时", Some(detail));
 }
 
-/// Install a portable Node.js (Windows x64 zip) under the app data dir,
-/// then re-run the boot flow. Runs on a background thread.
-fn install_portable_node(app: AppHandle) {
+fn run_install_wizard(app: AppHandle) {
     std::thread::spawn(move || {
-        emit(&app, "installing", "正在准备便携版 Node.js…", None);
-        let root = match app.path().app_data_dir() {
-            Ok(d) => d.join("node"),
+        let silent = app.state::<AppState>().silent.load(Ordering::SeqCst);
+        if silent {
+            fail(
+                &app,
+                true,
+                "need-install",
+                "自启模式下不会运行安装向导",
+                None,
+            );
+            return;
+        }
+
+        let paths = match AppPaths::from_app(&app) {
+            Ok(p) => {
+                let _ = p.ensure();
+                p
+            }
             Err(e) => {
-                emit(&app, "error", "获取应用数据目录失败", Some(e.to_string()));
+                fail(&app, false, "install", "获取应用目录失败", Some(e));
                 return;
             }
         };
-        if let Err(e) = std::fs::create_dir_all(&root) {
-            emit(&app, "error", "创建目录失败", Some(e.to_string()));
-            return;
-        }
+        *app.state::<AppState>().paths.lock().unwrap() = Some(paths.clone());
 
-        let ps = NODE_SETUP_PS1.replace("__NODE_ROOT__", &root.display().to_string());
-        let ps_path = root.join("setup-node.ps1");
-        if let Err(e) = std::fs::write(&ps_path, ps) {
-            emit(&app, "error", "写入安装脚本失败", Some(e.to_string()));
-            return;
-        }
+        let mut last_msg = String::new();
+        let mut progress = |msg: &str| {
+            last_msg = msg.to_string();
+            emit(&app, "installing", msg, None);
+            append_boot_file(&app, msg);
+        };
 
-        emit(&app, "installing", "正在下载并安装 Node.js（约 30MB）…", None);
-        let result = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                ps_path.to_str().unwrap_or(""),
-            ])
-            .stdin(Stdio::null())
-            .output();
-
-        match result {
-            Ok(out) if out.status.success() => {
-                let _ = std::fs::remove_file(&ps_path);
-                let node_exe = find_node_exe(&root);
-                match node_exe {
-                    Some(dir) => {
-                        *app.state::<AppState>().node_dir.lock().unwrap() = Some(dir.clone());
-                        emit(&app, "installed", "Node.js 安装完成，正在启动 DSH…", None);
-                        boot(app);
-                    }
-                    None => {
-                        let err = String::from_utf8_lossy(&out.stdout);
-                        emit(
-                            &app,
-                            "error",
-                            "Node.js 安装位置异常",
-                            Some(format!("未找到 node.exe。输出：{err}")),
-                        );
-                    }
+        match install_runtime(&paths, &mut progress) {
+            Ok(result) => {
+                let mut settings = app.state::<AppState>().settings.lock().unwrap().clone();
+                settings.node_exe = Some(result.node_exe.display().to_string());
+                settings.dsh_path = Some(result.dsh_path.display().to_string());
+                settings.dsh_version = result.dsh_version;
+                if let Err(e) = persist_settings(&app, &settings) {
+                    fail(&app, false, "install", "写入 settings 失败", Some(e));
+                    return;
                 }
+                emit(
+                    &app,
+                    "installed",
+                    "运行时安装完成，正在启动…",
+                    settings.dsh_version.clone(),
+                );
+                // Reset booting flag so boot() can run
+                app.state::<AppState>()
+                    .booting
+                    .store(false, Ordering::SeqCst);
+                boot(app);
             }
-            Ok(out) => {
-                let err = String::from_utf8_lossy(&out.stderr);
-                let tail: String = err.chars().rev().take(600).collect::<Vec<_>>().into_iter().rev().collect();
-                emit(&app, "error", "Node.js 安装失败", Some(tail));
+            Err(e) => {
+                fail(
+                    &app,
+                    false,
+                    "install",
+                    "安装运行时失败",
+                    Some(if last_msg.is_empty() {
+                        e
+                    } else {
+                        format!("{last_msg}\n{e}")
+                    }),
+                );
             }
-            Err(e) => emit(&app, "error", "Node.js 安装失败", Some(e.to_string())),
         }
     });
 }
 
-fn find_node_exe(root: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.is_dir() && p.join("node.exe").is_file() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct QuickAskEvent {
-    kind: &'static str,
-    text: String,
-    exit_code: Option<i32>,
-}
-
-fn emit_quick_ask(app: &AppHandle, kind: &'static str, text: String, exit_code: Option<i32>) {
-    let _ = app.emit(
-        "quick-ask-event",
-        QuickAskEvent {
-            kind,
-            text,
-            exit_code,
-        },
-    );
-}
-
-fn notify(app: &AppHandle, title: &str, body: &str) {
-    let _ = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show();
-    debug_log(&format!("notification: {title} - {body}"));
-}
-
-/// Run a one-shot headless dsh task (quick-ask): stream output to the popup
-/// and send a system notification when done.
-fn run_quick_ask_task(app: AppHandle, task: String) {
-    debug_log(&format!("quick_ask: task received: {task}"));
-    if app
-        .state::<AppState>()
-        .quick_ask_child
-        .lock()
-        .unwrap()
-        .is_some()
-    {
-        emit_quick_ask(&app, "error", "已有任务在运行".to_string(), None);
-        return;
-    }
-
-    let state = app.state::<AppState>();
-    let node_dir = state.node_dir.lock().unwrap().clone();
-
-    let mut cmd = Command::new("cmd");
-    cmd.arg("/C");
-    // Prefer a globally installed `dsh` over npx (see spawn_dsh for why).
-    let use_global = find_global_dsh();
-    if use_global {
-        debug_log("quick_ask: using globally installed `dsh`");
-        cmd.arg("dsh");
-    } else if let Some(dir) = &node_dir {
-        cmd.arg(dir.join("npx.cmd"));
-        let path = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{};{}", dir.display(), path));
-        cmd.arg("--yes").arg("@deepseek-ai/dsh");
-    } else {
-        cmd.arg("npx").arg("--yes").arg("@deepseek-ai/dsh");
-    }
-    cmd.env("npm_config_allow_scripts", NPM_ALLOW_SCRIPTS);
-    cmd.arg("--profile")
-        .arg("headless")
-        .arg(&task)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            emit_quick_ask(&app, "error", format!("无法启动任务：{e}"), None);
-            return;
-        }
-    };
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    *app.state::<AppState>().quick_ask_child.lock().unwrap() = Some(child);
-
-    let app_io = app.clone();
-    let reader = std::thread::spawn(move || {
-        let mut full = String::new();
-        if let Some(out) = stdout {
-            let mut reader = BufReader::new(out);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        full.push_str(&line);
-                        emit_quick_ask(&app_io, "output", line.clone(), None);
-                    }
-                }
-            }
-        }
-        if let Some(mut err) = stderr {
-            let mut s = String::new();
-            let _ = err.read_to_string(&mut s);
-            if !s.is_empty() {
-                full.push_str(&s);
-                emit_quick_ask(&app_io, "output", s, None);
-            }
-        }
-        full
-    });
-
-    let app_waiter = app.clone();
+fn run_upgrade_dsh(app: AppHandle) {
     std::thread::spawn(move || {
-        // Take the child out of state (clears the "busy" flag) and wait on it.
-        let mut child = app_waiter
-            .state::<AppState>()
-            .quick_ask_child
-            .lock()
-            .unwrap()
-            .take()
-            .expect("quick_ask_child must be Some");
-        let status = child.wait();
-        let full = reader.join().unwrap_or_default();
-        debug_log(&format!("quick_ask: task finished, full output: {full}"));
-        let code = status.as_ref().ok().and_then(|s| s.code());
-        match (&status, code) {
-            (Ok(s), _) if s.success() => {
-                notify(&app_waiter, "DSH 快问完成", &task_summary(&task, &full));
-                emit_quick_ask(&app_waiter, "done", full, None);
+        notify(&app, "升级 DSH", "正在升级 DeepSeek Harness…");
+        emit(&app, "installing", "正在升级 DSH…", None);
+
+        // Stop current child first
+        kill_spawned_child(&app);
+
+        let (paths, settings) = match load_or_recover_settings(&app) {
+            Ok(v) => v,
+            Err(e) => {
+                notify(&app, "升级失败", &e);
+                return;
             }
-            (Ok(s), _) => {
-                emit_quick_ask(&app_waiter, "error", full, s.code());
-                notify(&app_waiter, "DSH 快问失败", &format!("退出码：{:?}", s.code()));
+        };
+        *app.state::<AppState>().paths.lock().unwrap() = Some(paths.clone());
+
+        match upgrade_dsh(&settings, &paths) {
+            Ok(result) => {
+                let mut s = settings;
+                s.node_exe = Some(result.node_exe.display().to_string());
+                s.dsh_path = Some(result.dsh_path.display().to_string());
+                s.dsh_version = result.dsh_version.clone();
+                if let Err(e) = persist_settings(&app, &s) {
+                    notify(&app, "升级失败", &e);
+                    return;
+                }
+                notify(
+                    &app,
+                    "升级完成",
+                    &format!(
+                        "DSH {} 已安装，正在重启服务…",
+                        result.dsh_version.unwrap_or_else(|| "未知版本".into())
+                    ),
+                );
+                app.state::<AppState>()
+                    .booting
+                    .store(false, Ordering::SeqCst);
+                boot(app);
             }
-            (Err(e), _) => {
-                emit_quick_ask(&app_waiter, "error", format!("任务异常：{e}"), None);
+            Err(e) => {
+                notify(&app, "升级失败", &e);
+                emit(&app, "error", "升级 DSH 失败", Some(e));
             }
         }
     });
 }
 
-fn task_summary(task: &str, output: &str) -> String {
-    let task_short: String = task.chars().take(40).collect();
-    let out_trimmed = output.trim();
-    let out_short: String = out_trimmed.chars().take(120).collect();
-    if out_short.is_empty() {
-        format!("任务「{task_short}」已完成")
-    } else {
-        format!("任务「{task_short}」→ {out_short}")
-    }
-}
-
-fn show_main_window(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_focus();
-    }
-}
-
-#[tauri::command]
-fn start_boot(app: AppHandle) {
-    boot(app);
-}
-
-#[tauri::command]
-fn install_node(app: AppHandle) {
-    install_portable_node(app);
-}
-
-#[tauri::command]
-fn quick_ask(app: AppHandle, task: String) {
-    run_quick_ask_task(app, task);
-}
-
-#[tauri::command]
-fn hide_quick_ask(app: AppHandle) {
-    if let Some(w) = app.get_webview_window("quick-ask") {
-        let _ = w.hide();
-    }
-}
-
-/// Called by the quick-ask page when it is ready; focuses the input.
-#[tauri::command]
-fn quick_ask_ready(app: AppHandle) {
-    if let Some(w) = app.get_webview_window("quick-ask") {
-        let _ = w.set_focus();
-    }
-}
-
-#[tauri::command]
-fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
-    let autostart = app.autolaunch();
-    if enabled {
-        autostart.enable().map_err(|e| e.to_string())?;
-    } else {
-        autostart.disable().map_err(|e| e.to_string())?;
-    }
-    Ok(autostart.is_enabled().unwrap_or(enabled))
-}
-
-#[tauri::command]
-fn is_autostart(app: AppHandle) -> bool {
-    app.autolaunch().is_enabled().unwrap_or(false)
-}
-
-#[tauri::command]
-fn get_shortcut(app: AppHandle) -> String {
-    load_shortcut(&app)
-}
-
-#[tauri::command]
-fn set_shortcut(app: AppHandle, shortcut: String) -> Result<String, String> {
-    let shortcut = shortcut.trim().to_string();
-    if shortcut.is_empty() {
-        return Err("快捷键不能为空".into());
-    }
-    // Validate by attempting to register it.
-    let app2 = app.clone();
-    app2.global_shortcut()
-        .register(shortcut.as_str())
-        .map_err(|e| format!("快捷键无效或已被占用：{e}"))?;
-    let _ = app2.global_shortcut().unregister(shortcut.as_str());
-    save_shortcut(&app, &shortcut)?;
-    debug_log(&format!("shortcut saved as {shortcut}"));
-    Ok(shortcut)
-}
-
-#[tauri::command]
-fn quit_app(app: AppHandle) {
-    app.state::<AppState>().quitting.store(true, Ordering::SeqCst);
-    kill_spawned_child(&app);
-    app.exit(0);
-}
-
-fn check_update(app: &AppHandle) {
+fn check_update_shell(app: &AppHandle) {
     use tauri_plugin_updater::UpdaterExt;
     let app = app.clone();
     std::thread::spawn(move || {
-        notify(&app, "检查更新", "正在检查新版本…");
+        notify(&app, "检查更新", "正在检查桌面壳新版本…");
         let updater = match app.updater() {
             Ok(u) => u,
             Err(e) => {
@@ -706,129 +626,85 @@ fn check_update(app: &AppHandle) {
                     || {},
                 )) {
                     Ok(_) => {
-                        // On Windows the updater runs the NSIS installer
-                        // (`/UPDATE`, passive mode) and exits this process
-                        // itself inside download_and_install, so this branch
-                        // is effectively unreachable here — the installer
-                        // relaunches the app. For other platforms, exit
-                        // cleanly after killing the spawned dsh child.
-                        debug_log("update: installed, exiting");
                         kill_spawned_child(&app);
                         app.state::<AppState>().quitting.store(true, Ordering::SeqCst);
                         app.exit(0);
                     }
-                    Err(e) => {
-                        notify(&app, "更新失败", &format!("下载安装失败：{e}"));
-                    }
+                    Err(e) => notify(&app, "更新失败", &format!("{e}")),
                 }
             }
-            Ok(None) => {
-                notify(&app, "已是最新", "当前已是最新版本。");
-            }
-            Err(e) => {
-                notify(&app, "检查更新失败", &format!("{e}"));
-            }
+            Ok(None) => notify(&app, "已是最新", "桌面壳已是最新版本。"),
+            Err(e) => notify(&app, "检查更新失败", &format!("{e}")),
         }
     });
-}
-
-fn toggle_quick_ask(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("quick-ask") {
-        if w.is_visible().unwrap_or(false) {
-            let _ = w.hide();
-        } else {
-            let _ = w.show();
-            let _ = w.unminimize();
-            let _ = w.set_focus();
-        }
-    }
-}
-
-fn shortcut_config_path(app: &AppHandle) -> Option<PathBuf> {
-    app.path().app_config_dir().ok().map(|d| d.join("settings.json"))
-}
-
-fn load_shortcut(app: &AppHandle) -> String {
-    if let Some(path) = shortcut_config_path(app) {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(s) = v.get("quick_ask_shortcut").and_then(|x| x.as_str()) {
-                    if !s.trim().is_empty() {
-                        return s.to_string();
-                    }
-                }
-            }
-        }
-    }
-    QUICK_ASK_SHORTCUT.to_string()
-}
-
-fn save_shortcut(app: &AppHandle, shortcut: &str) -> Result<(), String> {
-    let path = shortcut_config_path(app).ok_or("无法获取配置目录")?;
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let mut map = serde_json::Map::new();
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        if let Ok(serde_json::Value::Object(existing)) = serde_json::from_str(&content) {
-            map = existing;
-        }
-    }
-    map.insert(
-        "quick_ask_shortcut".into(),
-        serde_json::Value::String(shortcut.to_string()),
-    );
-    std::fs::write(&path, serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap())
-        .map_err(|e| e.to_string())
-}
-
-fn setup_global_shortcut(app: &AppHandle) {
-    let shortcut = load_shortcut(app);
-    let app = app.clone();
-    let result = app.global_shortcut().on_shortcut(shortcut.as_str(), move |app, _shortcut, event| {
-        if event.state == ShortcutState::Pressed {
-            toggle_quick_ask(app);
-        }
-    });
-    if let Err(e) = result {
-        debug_log(&format!(
-            "register {shortcut} failed ({e}), trying fallback {QUICK_ASK_SHORTCUT_FALLBACK}"
-        ));
-        let app2 = app.clone();
-        let _ = app2.global_shortcut().on_shortcut(QUICK_ASK_SHORTCUT_FALLBACK, move |app, _shortcut, event| {
-            if event.state == ShortcutState::Pressed {
-                toggle_quick_ask(app);
-            }
-        });
-    } else {
-        debug_log(&format!("registered global shortcut {shortcut}"));
-    }
 }
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    use tauri::menu::CheckMenuItem;
-
     let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
-    let quick = MenuItem::with_id(app, "quick", "快问（Alt+Space）", true, None::<&str>)?;
-    let update = MenuItem::with_id(app, "update", "检查更新", true, None::<&str>)?;
+    let upgrade_dsh_item = MenuItem::with_id(app, "upgrade_dsh", "升级 DSH（手动）", true, None::<&str>)?;
+    let update_shell = MenuItem::with_id(app, "update", "检查壳更新", true, None::<&str>)?;
+    let diagnose = MenuItem::with_id(app, "diagnose", "打开诊断页", true, None::<&str>)?;
     let autostart = CheckMenuItem::with_id(
         app,
         "autostart",
-        "开机自启",
+        "开机自启（静默托盘）",
         true,
         app.autolaunch().is_enabled().unwrap_or(false),
         None::<&str>,
     )?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quick, &update, &autostart, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &show,
+            &upgrade_dsh_item,
+            &update_shell,
+            &diagnose,
+            &autostart,
+            &quit,
+        ],
+    )?;
 
     let mut builder = TrayIconBuilder::with_id("dsh-tray")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "show" => show_main_window(app),
-            "quick" => toggle_quick_ask(app),
-            "update" => check_update(app),
+            "show" => {
+                app.state::<AppState>()
+                    .silent
+                    .store(false, Ordering::SeqCst);
+                show_main_window(app);
+            }
+            "upgrade_dsh" => run_upgrade_dsh(app.clone()),
+            "update" => check_update_shell(app),
+            "diagnose" => {
+                app.state::<AppState>()
+                    .silent
+                    .store(false, Ordering::SeqCst);
+                let splash = app.state::<AppState>().splash_url.lock().unwrap().clone();
+                if let (Some(w), Some(url)) = (app.get_webview_window("main"), splash) {
+                    let _ = w.navigate(url);
+                }
+                show_main_window(app);
+                // Surface last error on splash without restarting the service
+                if let Some(paths) = app.state::<AppState>().paths.lock().unwrap().clone() {
+                    if let Ok(content) = std::fs::read_to_string(paths.last_error_file()) {
+                        emit(
+                            app,
+                            "error",
+                            "最近一次启动失败",
+                            Some(content),
+                        );
+                    } else {
+                        emit(
+                            app,
+                            "detecting",
+                            "暂无失败记录。可点「重试」重新检测。",
+                            None,
+                        );
+                    }
+                }
+            }
             "autostart" => {
                 let enabled = app.autolaunch().is_enabled().unwrap_or(false);
                 if enabled {
@@ -836,10 +712,12 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 } else {
                     let _ = app.autolaunch().enable();
                 }
-                debug_log(&format!(
-                    "autostart toggled to {}",
-                    app.autolaunch().is_enabled().unwrap_or(false)
-                ));
+                let now = app.autolaunch().is_enabled().unwrap_or(false);
+                let mut s = app.state::<AppState>().settings.lock().unwrap().clone();
+                s.autostart = now;
+                s.start_minimized = true;
+                let _ = persist_settings(app, &s);
+                debug_log(&format!("autostart toggled to {now}"));
             }
             "quit" => {
                 app.state::<AppState>()
@@ -857,6 +735,10 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
+                tray.app_handle()
+                    .state::<AppState>()
+                    .silent
+                    .store(false, Ordering::SeqCst);
                 show_main_window(tray.app_handle());
             }
         });
@@ -867,10 +749,125 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+#[tauri::command]
+fn start_boot(app: AppHandle) {
+    // User-driven: leave silent mode so errors can surface
+    app.state::<AppState>()
+        .silent
+        .store(false, Ordering::SeqCst);
+    show_main_window(&app);
+    boot(app);
+}
+
+#[tauri::command]
+fn install_runtime_cmd(app: AppHandle) {
+    run_install_wizard(app);
+}
+
+/// Back-compat alias for old frontend button name
+#[tauri::command]
+fn install_node(app: AppHandle) {
+    run_install_wizard(app);
+}
+
+#[tauri::command]
+fn upgrade_dsh_cmd(app: AppHandle) {
+    run_upgrade_dsh(app);
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let autostart = app.autolaunch();
+    if enabled {
+        autostart.enable().map_err(|e| e.to_string())?;
+    } else {
+        autostart.disable().map_err(|e| e.to_string())?;
+    }
+    let now = autostart.is_enabled().unwrap_or(enabled);
+    let mut s = app.state::<AppState>().settings.lock().unwrap().clone();
+    s.autostart = now;
+    s.start_minimized = true;
+    persist_settings(&app, &s)?;
+    Ok(now)
+}
+
+#[tauri::command]
+fn is_autostart(app: AppHandle) -> bool {
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.state::<AppState>().quitting.store(true, Ordering::SeqCst);
+    kill_spawned_child(&app);
+    app.exit(0);
+}
+
+#[tauri::command]
+fn get_runtime_info(app: AppHandle) -> serde_json::Value {
+    let s = app.state::<AppState>().settings.lock().unwrap().clone();
+    serde_json::json!({
+        "nodeExe": s.node_exe,
+        "dshPath": s.dsh_path,
+        "dshVersion": s.dsh_version,
+        "port": effective_port(&s),
+        "runtimeReady": s.runtime_ready(),
+    })
+}
+
+#[tauri::command]
+fn get_boot_status(app: AppHandle) -> Option<BootEvent> {
+    app.state::<AppState>().last_boot.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_last_error(app: AppHandle) -> Option<serde_json::Value> {
+    let paths = {
+        let state = app.state::<AppState>();
+        let guard = state.paths.lock().unwrap();
+        guard.clone()
+    };
+    let paths = paths.or_else(|| AppPaths::from_app(&app).ok())?;
+    let content = std::fs::read_to_string(paths.last_error_file()).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+// ---- Removed quick-ask surface (v1): stub commands keep old HTML from crashing if opened ----
+
+#[tauri::command]
+fn quick_ask(_app: AppHandle, _task: String) {
+    // intentionally disabled
+}
+
+#[tauri::command]
+fn hide_quick_ask(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("quick-ask") {
+        let _ = w.hide();
+    }
+}
+
+#[tauri::command]
+fn quick_ask_ready(_app: AppHandle) {}
+
+#[tauri::command]
+fn get_shortcut() -> String {
+    String::new()
+}
+
+#[tauri::command]
+fn set_shortcut(_shortcut: String) -> Result<String, String> {
+    Err("快问已在 v1 禁用".into())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let silent = is_minimized_arg();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            app.state::<AppState>()
+                .silent
+                .store(false, Ordering::SeqCst);
             show_main_window(app);
         }))
         .plugin(tauri_plugin_opener::init())
@@ -878,7 +875,8 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            // Autostart always passes --minimized → silent tray path
+            Some(vec!["--minimized".into()]),
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -886,18 +884,35 @@ pub fn run() {
         .manage(AppState {
             child: Mutex::new(None),
             boot_log: Arc::new(Mutex::new(String::new())),
-            node_dir: Mutex::new(None),
-            quick_ask_child: Mutex::new(None),
+            settings: Mutex::new(Settings::default()),
+            paths: Mutex::new(None),
+            splash_url: Mutex::new(None),
+            last_boot: Mutex::new(None),
+            silent: AtomicBool::new(silent),
+            booting: AtomicBool::new(false),
             quitting: AtomicBool::new(false),
+            restart_count: Mutex::new(0),
         })
-        .setup(|app| {
+        .setup(move |app| {
+            if let Some(w) = app.get_webview_window("main") {
+                if let Ok(url) = w.url() {
+                    *app.state::<AppState>().splash_url.lock().unwrap() = Some(url);
+                }
+            }
             setup_tray(app.handle())?;
-            setup_global_shortcut(app.handle());
+            if silent {
+                hide_main_window(app.handle());
+            }
+            // Backend owns the initial boot for both paths
+            boot(app.handle().clone());
+            let _ = MAX_AUTO_RESTART; // reserved for Ready→Degraded follow-up
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             start_boot,
+            install_runtime_cmd,
             install_node,
+            upgrade_dsh_cmd,
             quick_ask,
             hide_quick_ask,
             quick_ask_ready,
@@ -905,6 +920,9 @@ pub fn run() {
             is_autostart,
             get_shortcut,
             set_shortcut,
+            get_runtime_info,
+            get_boot_status,
+            get_last_error,
             quit_app
         ])
         .on_window_event(|window, event| {
@@ -923,4 +941,3 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
