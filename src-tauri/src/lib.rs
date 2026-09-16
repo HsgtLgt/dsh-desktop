@@ -617,6 +617,19 @@ fn boot_inner(app: &AppHandle, silent: bool) {
         }
     }
 
+    // Keep the recorded version honest for the diagnostics page — it can go
+    // stale when the prefix was upgraded outside the shell's own flow.
+    let on_disk = install::read_dsh_version(&paths.npm_prefix());
+    if on_disk != settings.dsh_version {
+        let mut s = settings.clone();
+        s.dsh_version = on_disk;
+        if let Err(e) = persist_settings(app, &s) {
+            debug_log(&format!("dsh_version sync failed: {e}"));
+        } else {
+            debug_log(&format!("dsh_version synced to {:?}", s.dsh_version));
+        }
+    }
+
     if settings.runtime_ready() {
         match ensure_web_profile(&settings, &dsh_home) {
             Ok(Some(msg)) => {

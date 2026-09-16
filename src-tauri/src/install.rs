@@ -287,7 +287,7 @@ fn install_dsh(node_dir: &Path, npm_prefix: &Path) -> Result<PathBuf, String> {
     Ok(dsh)
 }
 
-fn read_dsh_version(npm_prefix: &Path) -> Option<String> {
+pub(crate) fn read_dsh_version(npm_prefix: &Path) -> Option<String> {
     let pkg = npm_prefix
         .join("node_modules")
         .join("@deepseek-ai")
