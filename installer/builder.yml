@@ -1,0 +1,36 @@
+# electron-builder 配置模板。
+# __XXX__ 占位符由 scripts/package-app.mjs 替换成绝对路径后使用，
+# 所以仓库里这份文件不含任何本机路径。
+#
+# 只用于生成未打包应用（--dir）。最终安装包由 scripts/build-installer.mjs
+# 用自解压方案生成 —— 不走 electron-builder 的 NSIS，因为它需要下载境外工具链。
+
+appId: ai.deepseek.dsh.desktop
+productName: DeepSeek Harness
+copyright: DeepSeek
+
+directories:
+  output: .desktop-build/targets/win-x64/artifacts
+
+files:
+  - lib/**/*
+  - renderer/**/*
+  - package.json
+  - '!**/*.map'
+
+# 使用本地 Electron 分发，跳过下载与缓存
+electronDist: __ELECTRON_DIST__
+
+# 关闭 asar：运行时组件（dsh / runtime）必须以真实文件存在
+asar: false
+
+# 运行时资源与依赖补齐（extraResources 会丢掉 node_modules，所以走钩子）
+afterPack: __AFTERPACK__
+
+npmRebuild: false
+nodeGypRebuild: false
+
+win:
+  icon: __ICON__
+  # 只跳过签名，保留图标与版本元数据写入
+  signExecutable: false

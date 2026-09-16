@@ -1,31 +1,22 @@
-# Logs
-logs
+# 构建工作树（由 scripts/bootstrap.mjs 生成）
+/dsh-desktop-src/
+
+# 构建产物
+*.exe
+*.exe.config
+payload.zip
+builder.generated.yml
+
+# 日志与诊断
 *.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
+desktop-diag.log
+desktop-diagnostic.txt
 
-node_modules
-dist
-dist-ssr
-*.local
+# 图标生成中间产物
+/icon/icon-png/
 
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
-.DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-
-# test artifact
-app.pid
-
-# updater signing private key (NEVER commit; public key is in tauri.conf.json)
-keys/updater.key
-keys/*.key
+# 编辑器与系统
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
