@@ -27,6 +27,19 @@
 
 ---
 
+## 直接下载（不想自己构建）
+
+| 版本 | 安装包 | 大小 |
+|---|---|---|
+| [v0.1.6-alpha.1](https://github.com/HsgtLgt/dsh-desktop/releases/tag/v0.1.6-alpha.1) | [DSH-Setup.exe](https://github.com/HsgtLgt/dsh-desktop/releases/download/v0.1.6-alpha.1/DSH-Setup.exe) | 332 MB |
+
+对应官方 DSH `0.1.6-alpha.1`。**无需预装 Node.js 或 dsh**，运行时已内置。
+
+> 安装包未做数字签名，SmartScreen 会提示「未知发布者」，选择「仍要运行」即可。
+> 校验值见 Release 说明页。
+
+---
+
 ## 环境要求
 
 - **Windows 10/11 x64**
