@@ -9,7 +9,7 @@
  * 前置：node scripts/make-payload.mjs（需要 payload.zip）
  * 用法：node scripts/build-installer.mjs
  */
-import { createReadStream, createWriteStream, existsSync, mkdirSync, statSync } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { copyFile, rm, writeFile } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { execFileSync } from 'node:child_process';
@@ -44,10 +44,11 @@ for (const name of ['Setup.cs', 'manifest.xml', 'setup.exe.config']) {
 await copyFile(join(ICON_DIR, 'icon.ico'), join(STAGE, 'icon.ico'));
 const setupExe = join(STAGE, 'setup.exe');
 await rm(setupExe, { force: true });
+// /target:winexe = 窗口程序（无控制台窗口）；System.Windows.Forms 提供向导界面
 execFileSync(resolveCsc(), [
-  '/nologo', '/target:exe', '/platform:anycpu', '/optimize+',
+  '/nologo', '/target:winexe', '/platform:anycpu', '/optimize+',
   '/out:' + setupExe,
-  '/r:System.IO.Compression.dll', '/r:System.IO.Compression.FileSystem.dll',
+  '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll',
   '/win32manifest:manifest.xml',
   '/win32icon:icon.ico',
   'Setup.cs',
@@ -55,13 +56,20 @@ execFileSync(resolveCsc(), [
 await copyFile(join(STAGE, 'setup.exe.config'), setupExe + '.config');
 console.log('    setup.exe = ' + (statSync(setupExe).size / 1024).toFixed(1) + ' KB');
 
-// 2) 组装：setup.exe + payload.zip + 长度 + 标记
+// 2) 组装：setup.exe + payload.zip + 长度 + 文件数 + 标记
+//    文件数写进 trailer，安装器用它算进度（不必在运行时扫描 5 万个文件）
 console.log('[2/3] 合成自解压安装包 ...');
 const payloadLength = statSync(payload).size;
+const fileCountPath = join(STAGE, 'filecount.txt');
+const payloadFiles = existsSync(fileCountPath) ? Number(readFileSync(fileCountPath, 'utf8').trim()) : 0;
+if (!payloadFiles) {
+  throw new Error('缺少 ' + fileCountPath + '\n  → 先运行 node scripts/make-payload.mjs');
+}
 const trailer = Buffer.alloc(8 + MARKER.length);
 trailer.writeUInt32LE(payloadLength >>> 0, 0);
-trailer.writeUInt32LE(0, 4);
+trailer.writeUInt32LE(payloadFiles >>> 0, 4);
 Buffer.from(MARKER, 'ascii').copy(trailer, 8);
+console.log('    载荷文件数 = ' + payloadFiles);
 
 await rm(OUTPUT, { force: true });
 const out = createWriteStream(OUTPUT);

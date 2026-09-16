@@ -9,7 +9,7 @@
  * 用法：node scripts/make-payload.mjs
  */
 import { spawn } from 'node:child_process';
-import { createWriteStream, existsSync, statSync, rmSync } from 'node:fs';
+import { createWriteStream, existsSync, statSync, rmSync, writeFileSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { INSTALLER, ROOT, STAGE, UNPACKED } from './vars.mjs';
@@ -23,6 +23,23 @@ function resolveSevenZip() {
   ].filter(Boolean);
   for (const candidate of candidates) if (existsSync(candidate)) return candidate;
   throw new Error('找不到 7z.exe，请安装 7-Zip 或用 SEVEN_ZIP 指定路径');
+}
+
+/** 递归统计文件数（不含目录）。 */
+async function countFiles(dir) {
+  let count = 0;
+  const stack = [dir];
+  while (stack.length) {
+    const current = stack.pop();
+    let entries;
+    try { entries = await readdir(current, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const path = join(current, entry.name);
+      if (entry.isDirectory()) stack.push(path);
+      else count++;
+    }
+  }
+  return count;
 }
 
 function run(command, args, cwd) {
@@ -63,6 +80,12 @@ console.log('依赖自检通过：@deepseek-ai/dsh-home-paths');
 const zip = join(STAGE, 'payload.zip');
 rmSync(zip, { force: true });
 const sevenZip = resolveSevenZip();
+// 4) 统计文件数（供安装器显示进度，避免运行时扫描 5 万个文件）
+const unpacked = join(STAGE, 'win-unpacked');
+const fileCount = await countFiles(unpacked);
+writeFileSync(join(STAGE, 'filecount.txt'), String(fileCount), 'utf8');
+console.log('载荷文件数 = ' + fileCount);
+
 const archive = await run(sevenZip, [
   'a', '-tzip', '-mx=1', '-mcu=on', 'payload.zip', 'win-unpacked', 'install.ps1', 'uninstall.cmd',
 ], STAGE);

@@ -11,13 +11,38 @@
  *
  * 所有脚本都从这里取路径，不要在别处硬编码本机目录。
  */
+import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /** 仓库根目录。 */
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
+/**
+ * 定位构建工作树。
+ *
+ * 推荐布局是把工作树放在仓库内（<repo>/dsh-desktop-src，已被 .gitignore 忽略）；
+ * 也兼容与仓库同级（<repo>/../dsh-desktop-src）以及 DSH_WORK 环境变量指定的位置。
+ * 这样脚本既能在标准 clone 里跑，也能在已有工作树的机器上直接跑。
+ */
+function resolveWork() {
+  if (process.env.DSH_WORK) {
+    return resolve(process.env.DSH_WORK);
+  }
+  const candidates = [
+    join(ROOT, 'dsh-desktop-src'),
+    join(ROOT, '..', 'dsh-desktop-src'),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(join(candidate, 'apps', 'desktop'))) {
+      return candidate;
+    }
+  }
+  return candidates[0];
+}
+
 /** 构建工作树（由 bootstrap.mjs 准备，已加入 .gitignore）。 */
-export const WORK = join(ROOT, 'dsh-desktop-src');
+export const WORK = resolveWork();
 /** Electron 壳源码目录。 */
 export const APP = join(WORK, 'apps', 'desktop');
 /** 私有 Host 源码目录。 */

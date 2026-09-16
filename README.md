@@ -92,12 +92,20 @@ node scripts/dev-start.mjs --check  # 启动并校验界面是否加载出来
 
 ## 安装包行为
 
-双击 `DSH-Setup.exe` 后：
+双击 `DSH-Setup.exe` 进入**图形化安装向导**（WinForms，无控制台窗口）：
 
-1. 解压到临时目录（约 930 MB，1-3 分钟，控制台会显示进度）
-2. 安装到 `%LOCALAPPDATA%\Programs\DeepSeek Harness`
-3. 创建桌面快捷方式与开始菜单项，并注册到「应用和功能」
-4. 自动启动
+| 步骤 | 内容 |
+|---|---|
+| 1. 欢迎 | 显示安装位置与所需磁盘空间 |
+| 2. 选择安装位置 | 默认 `%LOCALAPPDATA%\Programs\DeepSeek Harness`，可更改；路径偏长时给出提示 |
+| 3. 安装选项 | 是否创建桌面快捷方式 / 开始菜单项 |
+| 4. 安装中 | 实时进度条 + 「已处理 N / 47328 个文件」计数 |
+| 5. 完成 | 可勾选立即启动，失败时在同一页显示原因 |
+
+![欢迎页](docs/screenshots/welcome.png)
+![安装进度](docs/screenshots/progress.png)
+
+安装过程约 2-3 分钟（解压约 930 MB 后复制到位）。安装完成后注册到「应用和功能」。
 
 卸载：运行安装目录下的 `uninstall.cmd`，或从「应用和功能」卸载。
 
@@ -121,8 +129,8 @@ node scripts/dev-start.mjs --check  # 启动并校验界面是否加载出来
 │   ├── afterpack.mjs         electron-builder 钩子
 │   └── tools/                窗口检查等诊断脚本
 ├── installer/                安装器源码
-│   ├── Setup.cs              C# 自解压宿主
-│   ├── install.ps1           实际安装逻辑
+│   ├── Setup.cs              C# 自解压宿主 + WinForms 图形化向导（约 850 行）
+│   ├── install.ps1           无界面安装逻辑（无人值守场景可用）
 │   ├── uninstall.cmd         卸载
 │   ├── manifest.xml          长路径感知 + UTF-8 代码页
 │   └── builder.yml           electron-builder 配置模板
