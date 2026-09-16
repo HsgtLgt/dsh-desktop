@@ -63,6 +63,11 @@ impl AppPaths {
         let day = chrono_like_date();
         self.logs_dir().join(format!("boot-{day}.log"))
     }
+
+    /// Old isolated home (0.1.x shells); merged into ~/.dsh once, then ignored.
+    pub fn legacy_dsh_home(&self) -> PathBuf {
+        self.root.join("dsh-home")
+    }
 }
 
 fn chrono_like_date() -> String {

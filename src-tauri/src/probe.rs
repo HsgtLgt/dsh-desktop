@@ -5,6 +5,10 @@ use std::{
 };
 
 /// Application-level readiness: TCP + HTTP status — never sniff HTML/doctype.
+///
+/// Any well-formed HTTP status counts as ready. Since dsh 0.1.6 the root
+/// answers 401 until the browser presents its per-launch token, so requiring
+/// 2xx/3xx would make a perfectly healthy service look "not ready".
 pub fn probe(port: u16) -> bool {
     let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
         return false;
@@ -22,15 +26,14 @@ pub fn probe(port: u16) -> bool {
     };
     let head = String::from_utf8_lossy(&buf[..n]);
     // Status line like "HTTP/1.1 200 OK"
-    let status_ok = head
-        .lines()
+    head.lines()
         .next()
-        .map(|line| {
-            line.contains(" 200 ")
-                || line.contains(" 301 ")
-                || line.contains(" 302 ")
-                || line.contains(" 304 ")
+        .and_then(|line| line.strip_prefix("HTTP/"))
+        .and_then(|rest| {
+            let mut it = rest.split_whitespace();
+            it.next()?;
+            it.next()?.parse::<u16>().ok()
         })
-        .unwrap_or(false);
-    status_ok
+        .map(|code| (100..=599).contains(&code))
+        .unwrap_or(false)
 }

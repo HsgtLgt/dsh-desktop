@@ -10,6 +10,93 @@ use crate::settings::Settings;
 pub const NPM_ALLOW_SCRIPTS: &str =
     "@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs";
 
+/// The dsh release this shell build is validated against. Bump when adopting
+/// a new official release. Installed as an exact spec so upgrades are
+/// reproducible; the boot path auto-upgrades once when the installed version
+/// is older than this.
+pub const DSH_NPM_SPEC: &str = "@deepseek-ai/dsh@0.1.6-alpha.1";
+
+/// Version portion of [`DSH_NPM_SPEC`], e.g. "0.1.6-alpha.1".
+pub fn desired_dsh_version() -> &'static str {
+    DSH_NPM_SPEC.rsplit('@').next().unwrap_or(DSH_NPM_SPEC)
+}
+
+/// True when the installed dsh is older than [`desired_dsh_version`] and an
+/// upgrade would move it forward. Never downgrades a newer install.
+pub fn should_upgrade_dsh(npm_prefix: &Path) -> bool {
+    match read_dsh_version(npm_prefix) {
+        Some(installed) => version_gt(desired_dsh_version(), &installed),
+        None => true,
+    }
+}
+
+/// Minimal semver-ish ordering: numeric major.minor.patch, then prerelease
+/// (release > rc > beta > alpha, later numbers win). Enough to decide
+/// "installed is behind the pin"; unknown shapes compare lexicographically.
+fn version_gt(a: &str, b: &str) -> bool {
+    let (ac, ap) = split_prerelease(a);
+    let (bc, bp) = split_prerelease(b);
+    for (x, y) in ac.iter().zip(bc.iter()) {
+        if x != y {
+            return x > y;
+        }
+    }
+    if ac != bc {
+        return ac > bc;
+    }
+    match (ap, bp) {
+        (None, None) => false,
+        (Some(_), None) => false, // prerelease < release
+        (None, Some(_)) => true,
+        (Some(x), Some(y)) => pre_gt(x, y),
+    }
+}
+
+fn split_prerelease(v: &str) -> ([u64; 3], Option<&str>) {
+    let (core, pre) = match v.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (v, None),
+    };
+    let mut nums = [0u64; 3];
+    for (i, part) in core.split('.').take(3).enumerate() {
+        nums[i] = part.parse().unwrap_or(0);
+    }
+    (nums, pre)
+}
+
+fn pre_gt(a: &str, b: &str) -> bool {
+    fn rank(tok: &str) -> u64 {
+        match tok {
+            "alpha" => 0,
+            "beta" => 1,
+            "rc" => 2,
+            _ => 3,
+        }
+    }
+    let av: Vec<&str> = a.split('.').collect();
+    let bv: Vec<&str> = b.split('.').collect();
+    for i in 0..av.len().max(bv.len()) {
+        let x = av.get(i);
+        let y = bv.get(i);
+        match (x, y) {
+            (None, None) => return false,
+            (None, Some(_)) => return false, // shorter prerelease is lower
+            (Some(_), None) => return true,
+            (Some(xt), Some(yt)) => {
+                let xn = xt.parse::<u64>().ok();
+                let yn = yt.parse::<u64>().ok();
+                match (xn, yn) {
+                    (Some(xn), Some(yn)) if xn != yn => return xn > yn,
+                    (Some(_), Some(_)) => {}
+                    _ if xt != yt => return rank(xt) > rank(yt),
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
 const NODE_SETUP_PS1: &str = r#"$ErrorActionPreference = 'Stop'
 $idx = curl.exe -sL --fail 'https://nodejs.org/dist/index.json'
 $json = $idx | ConvertFrom-Json
@@ -120,7 +207,7 @@ fn install_dsh(node_dir: &Path, npm_prefix: &Path) -> Result<PathBuf, String> {
         .arg("--prefix")
         .arg(npm_prefix)
         .arg(format!("--allow-scripts={NPM_ALLOW_SCRIPTS}"))
-        .arg("@deepseek-ai/dsh")
+        .arg(DSH_NPM_SPEC)
         .env("npm_config_allow_scripts", NPM_ALLOW_SCRIPTS)
         .stdin(Stdio::null());
 

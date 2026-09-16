@@ -1,10 +1,13 @@
 mod install;
+mod migrate;
 mod paths;
+mod profile_repair;
 mod probe;
 mod settings;
 
 use std::{
     io::Read,
+    path::Path,
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -22,8 +25,12 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_notification::NotificationExt;
 
-use install::{install_runtime, recover_from_disk, upgrade_dsh, NPM_ALLOW_SCRIPTS};
+use install::{
+    install_runtime, recover_from_disk, should_upgrade_dsh, upgrade_dsh, desired_dsh_version,
+    NPM_ALLOW_SCRIPTS,
+};
 use paths::AppPaths;
+use profile_repair::{ensure_web_profile, user_dsh_home};
 use probe::probe;
 use settings::Settings;
 
@@ -191,6 +198,28 @@ fn load_or_recover_settings(app: &AppHandle) -> Result<(AppPaths, Settings), Str
     let paths = AppPaths::from_app(app)?;
     debug_log(&format!("load_or_recover: root={}", paths.root.display()));
     paths.ensure()?;
+
+    // One-time: fold the old isolated dsh-home/ into the real ~/.dsh.
+    if let Some(user_home) = user_dsh_home() {
+        let marker = paths.state_dir().join(".legacy-home-merged");
+        if !marker.is_file() {
+            match migrate::merge_legacy_desktop_home(&paths.legacy_dsh_home(), &user_home) {
+                Ok(Some(summary)) => {
+                    debug_log(&format!("legacy merge: {summary}"));
+                    emit(
+                        app,
+                        "detecting",
+                        "已合并旧桌面数据目录到 ~/.dsh…",
+                        Some(summary),
+                    );
+                }
+                Ok(None) => debug_log("legacy merge: nothing to merge"),
+                Err(e) => debug_log(&format!("legacy merge failed (continuing): {e}")),
+            }
+            let _ = std::fs::write(&marker, "done\n");
+        }
+    }
+
     let mut settings = Settings::load(&paths.settings_file());
 
     if !settings.runtime_ready() {
@@ -224,7 +253,14 @@ fn persist_settings(app: &AppHandle, settings: &Settings) -> Result<(), String> 
 }
 
 /// Spawn pinned dsh web. Never uses npx on the production hot path.
-fn spawn_dsh(settings: &Settings, boot_log: Arc<Mutex<String>>) -> std::io::Result<Child> {
+///
+/// `dsh_home` is the user's real `~/.dsh` so desktop and CLI share sessions,
+/// settings and credentials (passed via DSH_HOME, same env var the CLI reads).
+fn spawn_dsh(
+    settings: &Settings,
+    dsh_home: &Path,
+    boot_log: Arc<Mutex<String>>,
+) -> std::io::Result<Child> {
     let port = effective_port(settings);
     let node_exe = settings
         .node_exe_path()
@@ -235,6 +271,8 @@ fn spawn_dsh(settings: &Settings, boot_log: Arc<Mutex<String>>) -> std::io::Resu
     let node_dir = node_exe.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "nodeExe has no parent")
     })?;
+
+    std::fs::create_dir_all(dsh_home)?;
 
     let mut cmd = Command::new("cmd");
     cmd.arg("/C").arg(&dsh_path).arg("web").arg("--port").arg(port.to_string());
@@ -251,7 +289,10 @@ fn spawn_dsh(settings: &Settings, boot_log: Arc<Mutex<String>>) -> std::io::Resu
         "PATH",
         format!("{};{};{}", node_dir.display(), prefix, path),
     );
-    // Stable cwd: user's profile — avoids System32 when launched from autostart
+    // Same home as CLI dsh (`~/.dsh`) — sessions/settings stay in one place.
+    cmd.env("DSH_HOME", dsh_home);
+    // dsh uses cwd() as the default workspace root — keep the user profile,
+    // avoids System32 when launched from autostart.
     if let Some(home) = std::env::var_os("USERPROFILE") {
         cmd.current_dir(home);
     }
@@ -267,9 +308,10 @@ fn spawn_dsh(settings: &Settings, boot_log: Arc<Mutex<String>>) -> std::io::Resu
     }
 
     debug_log(&format!(
-        "spawn_dsh: {} web --port {port} --no-open (node={})",
+        "spawn_dsh: {} web --port {port} --no-open (node={}, DSH_HOME={})",
         dsh_path.display(),
-        node_exe.display()
+        node_exe.display(),
+        dsh_home.display()
     ));
 
     let mut child = cmd.spawn()?;
@@ -280,6 +322,33 @@ fn spawn_dsh(settings: &Settings, boot_log: Arc<Mutex<String>>) -> std::io::Resu
         tee_into_log(err, boot_log);
     }
     Ok(child)
+}
+
+/// Parse the last `dsh web: <url>` line from the boot log.
+///
+/// Since dsh 0.1.6 the printed URL carries a per-launch auth token; without it
+/// the root only answers 401. The token exists solely in child stdout, so this
+/// is the only way to obtain the authenticated URL. Older dsh versions print
+/// the plain URL, which still navigates fine.
+fn extract_announced_url(app: &AppHandle, port: u16) -> Option<String> {
+    let state = app.state::<AppState>();
+    let log = state.boot_log.lock().unwrap();
+    let needle = "dsh web: ";
+    let mut found: Option<String> = None;
+    let mut from = 0;
+    while let Some(pos) = log[from..].find(needle) {
+        let abs = from + pos + needle.len();
+        let rest = &log[abs..];
+        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        let url = &rest[..end];
+        let ok = url.starts_with("http://")
+            && (url.contains(&format!("127.0.0.1:{port}")) || url.contains(&format!("localhost:{port}")));
+        if ok {
+            found = Some(url.to_string());
+        }
+        from = abs;
+    }
+    found
 }
 
 fn kill_spawned_child(app: &AppHandle) {
@@ -301,10 +370,21 @@ fn kill_spawned_child(app: &AppHandle) {
 }
 
 fn navigate_to_dsh(app: &AppHandle, port: u16) {
-    let url = format!("http://127.0.0.1:{port}");
+    // Prefer the URL dsh itself announced (carries the 0.1.6+ auth token);
+    // fall back to the plain loopback URL for older versions.
+    let url = extract_announced_url(app, port)
+        .unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
     if let Some(w) = app.get_webview_window("main") {
         let res = w.navigate(Url::parse(&url).expect("valid URL"));
         debug_log(&format!("navigate to {url}: {:?}", res.map(|_| "ok")));
+    }
+}
+
+fn navigate_to_splash(app: &AppHandle) {
+    let splash = app.state::<AppState>().splash_url.lock().unwrap().clone();
+    if let (Some(w), Some(url)) = (app.get_webview_window("main"), splash) {
+        let res = w.navigate(url);
+        debug_log(&format!("navigate to splash: {:?}", res.map(|_| "ok")));
     }
 }
 
@@ -312,7 +392,7 @@ fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
-        let _ = w.set_focus();
+        // Do not force focus — avoids stealing mouse/keyboard from the user.
     }
 }
 
@@ -325,6 +405,7 @@ fn hide_main_window(app: &AppHandle) {
 fn fail(app: &AppHandle, silent: bool, stage: &str, message: &str, detail: Option<String>) {
     write_last_error(app, stage, message, detail.clone());
     append_boot_file(app, &format!("FAIL [{stage}] {message} {:?}", detail));
+    // Cache status BEFORE navigating away from a dead dsh page, so splash can sync.
     if silent {
         notify(app, "DSH Desktop", message);
         // Do not emit error UI stages that would demand a modal — still emit for diagnostics page if opened later
@@ -332,6 +413,38 @@ fn fail(app: &AppHandle, silent: bool, stage: &str, message: &str, detail: Optio
     } else {
         emit(app, "error", message, detail);
     }
+    navigate_to_splash(app);
+    if !silent {
+        show_main_window(app);
+    }
+}
+
+/// After Ready, keep watching the child. dsh may print its URL before plugins
+/// finish loading and then exit — without this the WebView would just go black.
+fn watch_child_after_ready(app: AppHandle, silent: bool) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(800));
+        if app.state::<AppState>().quitting.load(Ordering::SeqCst) {
+            return;
+        }
+        let died = app
+            .state::<AppState>()
+            .child
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|c| c.try_wait().ok().flatten());
+        if let Some(status) = died {
+            let tail = boot_log_tail(&app);
+            let detail = if tail.is_empty() {
+                format!("退出码：{status}")
+            } else {
+                format!("退出码：{status}\n\n--- dsh 输出尾部 ---\n{tail}")
+            };
+            fail(&app, silent, "exited", "DSH 进程已退出", Some(detail));
+            return;
+        }
+    });
 }
 
 fn boot(app: AppHandle) {
@@ -410,10 +523,76 @@ fn boot_inner(app: &AppHandle, silent: bool) {
     }
 
     emit(app, "starting", "正在启动 DSH…", None);
-    start_dsh_and_wait(app, &settings, silent);
+
+    let dsh_home = match user_dsh_home() {
+        Some(h) => h,
+        None => {
+            fail(
+                app,
+                silent,
+                "spawning",
+                "启动 DSH 失败",
+                Some("无法解析用户目录（USERPROFILE）".into()),
+            );
+            return;
+        }
+    };
+
+    // Keep the pinned runtime at the version this shell build was validated
+    // against (e.g. 0.1.1-rc.2 → 0.1.6). Skipped in silent autostart so boot
+    // never touches the network in the background; the next manual open does it.
+    if !silent && should_upgrade_dsh(&paths.npm_prefix()) {
+        emit(
+            app,
+            "installing",
+            &format!(
+                "检测到 DSH 版本落后，正在升级到 {}…（首次约需 1-2 分钟）",
+                desired_dsh_version()
+            ),
+            None,
+        );
+        append_boot_file(app, &format!("auto-upgrade: target {}", desired_dsh_version()));
+        match upgrade_dsh(&settings, &paths) {
+            Ok(result) => {
+                let mut s = settings.clone();
+                s.dsh_path = Some(result.dsh_path.display().to_string());
+                s.dsh_version = result.dsh_version.clone();
+                if let Err(e) = persist_settings(app, &s) {
+                    debug_log(&format!("auto-upgrade: settings persist failed: {e}"));
+                } else {
+                    debug_log(&format!(
+                        "auto-upgrade: now {}",
+                        result.dsh_version.unwrap_or_default()
+                    ));
+                }
+            }
+            Err(e) => {
+                // Fall back to booting whatever is installed; retry next open.
+                debug_log(&format!("auto-upgrade failed (continuing): {e}"));
+                notify(
+                    app,
+                    "DSH 升级失败",
+                    &format!("将先用现有版本启动，下次打开时重试。{e}"),
+                );
+            }
+        }
+    }
+
+    if settings.runtime_ready() {
+        match ensure_web_profile(&settings, &dsh_home) {
+            Ok(Some(msg)) => {
+                debug_log(&format!("profile repair: {msg}"));
+                emit(app, "starting", "正在修复 DSH 配置…", Some(msg));
+            }
+            Ok(None) => {}
+            Err(e) => debug_log(&format!("profile repair failed (continuing): {e}")),
+        }
+    }
+
+    start_dsh_and_wait(app, &settings, &dsh_home, silent);
 }
 
-fn start_dsh_and_wait(app: &AppHandle, settings: &Settings, silent: bool) {
+fn start_dsh_and_wait(app: &AppHandle, settings: &Settings, dsh_home: &Path, silent: bool) {
     let port = effective_port(settings);
     let boot_log = app.state::<AppState>().boot_log.clone();
     {
@@ -421,7 +600,7 @@ fn start_dsh_and_wait(app: &AppHandle, settings: &Settings, silent: bool) {
         log.clear();
     }
 
-    let child = match spawn_dsh(settings, boot_log) {
+    let child = match spawn_dsh(settings, dsh_home, boot_log) {
         Ok(c) => c,
         Err(e) => {
             fail(
@@ -442,13 +621,40 @@ fn start_dsh_and_wait(app: &AppHandle, settings: &Settings, silent: bool) {
 
     while Instant::now() < deadline {
         if probe(port) {
-            debug_log("start_dsh: ready");
+            // dsh may accept HTTP before the plugin tree finishes loading; wait,
+            // confirm the process is still alive, and re-probe before handing
+            // the WebView over.
+            std::thread::sleep(Duration::from_millis(1500));
+            let still_alive = app
+                .state::<AppState>()
+                .child
+                .lock()
+                .unwrap()
+                .as_mut()
+                .map(|c| c.try_wait().ok().flatten().is_none())
+                .unwrap_or(false);
+            if !still_alive {
+                let tail = boot_log_tail(app);
+                let detail = if tail.is_empty() {
+                    "服务刚就绪即退出。".to_string()
+                } else {
+                    format!("服务刚就绪即退出。\n\n--- dsh 输出尾部 ---\n{tail}")
+                };
+                fail(app, silent, "exited", "DSH 进程已退出", Some(detail));
+                return;
+            }
+            if !probe(port) {
+                continue;
+            }
+
+            debug_log("start_dsh: ready (stable)");
             *app.state::<AppState>().restart_count.lock().unwrap() = 0;
             emit(app, "ready", "DSH 已就绪", None);
             navigate_to_dsh(app, port);
             if !silent {
                 show_main_window(app);
             }
+            watch_child_after_ready(app.clone(), silent);
             return;
         }
         let died = app
