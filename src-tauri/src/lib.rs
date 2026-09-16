@@ -10,7 +10,7 @@ use std::{
     path::Path,
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -31,7 +31,7 @@ use install::{
 };
 use paths::AppPaths;
 use profile_repair::{ensure_web_profile, user_dsh_home};
-use probe::probe;
+use probe::{probe, probe_status};
 use settings::Settings;
 
 const MAX_BOOT_LOG: usize = 8192;
@@ -50,6 +50,11 @@ struct AppState {
     booting: AtomicBool,
     quitting: AtomicBool,
     restart_count: Mutex<u8>,
+    /// Incremented on every spawn attempt. Post-ready watchers only report
+    /// failures for the generation they started with — otherwise an
+    /// upgrade/reset's intentional kill would surface as a ghost "DSH 已退出"
+    /// error, and stale watcher threads would pile up.
+    spawn_generation: AtomicU64,
 }
 
 #[derive(Clone, Serialize)]
@@ -353,6 +358,10 @@ fn extract_announced_url(app: &AppHandle, port: u16) -> Option<String> {
 
 fn kill_spawned_child(app: &AppHandle) {
     let state = app.state::<AppState>();
+    // Invalidate watchers BEFORE killing: an intentional stop must never look
+    // like a crash to the post-ready watcher, including the window between
+    // the kill and the next spawn bumping the generation itself.
+    state.spawn_generation.fetch_add(1, Ordering::SeqCst);
     let child = {
         let mut guard = state.child.lock().unwrap();
         guard.take()
@@ -436,14 +445,17 @@ fn fail(app: &AppHandle, silent: bool, stage: &str, message: &str, detail: Optio
 
 /// After Ready, keep watching the child. dsh may print its URL before plugins
 /// finish loading and then exit — without this the WebView would just go black.
-fn watch_child_after_ready(app: AppHandle, silent: bool) {
+/// Exits silently when a newer generation spawns (upgrade/reset) or on quit.
+fn watch_child_after_ready(app: AppHandle, silent: bool, generation: u64) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(800));
-        if app.state::<AppState>().quitting.load(Ordering::SeqCst) {
+        let state = app.state::<AppState>();
+        if state.quitting.load(Ordering::SeqCst)
+            || state.spawn_generation.load(Ordering::SeqCst) != generation
+        {
             return;
         }
-        let died = app
-            .state::<AppState>()
+        let died = state
             .child
             .lock()
             .unwrap()
@@ -509,7 +521,19 @@ fn boot_inner(app: &AppHandle, silent: bool) {
 
     if probe(port) {
         debug_log("boot: existing healthy service on port");
-        emit(app, "ready", "DSH 已在运行，正在打开…", None);
+        // A service we did not spawn keeps its launch token to itself; the
+        // webview can still get in via its persisted cookie. Say so, instead
+        // of letting a bare 401 page confuse the user when there is no cookie.
+        if probe_status(port) == Some(401) {
+            emit(
+                app,
+                "detecting",
+                "检测到已有 DSH 服务（带访问令牌），正在用已保存的凭据打开…",
+                Some("若打开后显示 401，请在该服务的终端里复制带 token 的地址，或重启 DSH Desktop 让壳自己拉起服务。".into()),
+            );
+        } else {
+            emit(app, "ready", "DSH 已在运行，正在打开…", None);
+        }
         navigate_to_dsh(app, port);
         if !silent {
             show_main_window(app);
@@ -610,7 +634,7 @@ fn boot_inner(app: &AppHandle, silent: bool) {
 }
 
 enum WaitOutcome {
-    Ready,
+    Ready(u64),
     SpawnErr(String),
     Exited { detail: String },
     Timeout { detail: String },
@@ -620,14 +644,14 @@ fn start_dsh_and_wait(app: &AppHandle, settings: &Settings, dsh_home: &Path, sil
     let dsh_home = dsh_home.to_path_buf();
     for attempt in 0..2u8 {
         match spawn_and_await(app, settings, &dsh_home) {
-            WaitOutcome::Ready => {
+            WaitOutcome::Ready(generation) => {
                 *app.state::<AppState>().restart_count.lock().unwrap() = 0;
                 emit(app, "ready", "DSH 已就绪", None);
                 navigate_to_dsh(app, effective_port(settings));
                 if !silent {
                     show_main_window(app);
                 }
-                watch_child_after_ready(app.clone(), silent);
+                watch_child_after_ready(app.clone(), silent, generation);
                 return;
             }
             WaitOutcome::SpawnErr(e) => {
@@ -683,6 +707,12 @@ fn spawn_and_await(
         log.clear();
     }
 
+    let generation = app
+        .state::<AppState>()
+        .spawn_generation
+        .fetch_add(1, Ordering::SeqCst)
+        + 1;
+
     let child = match spawn_dsh(settings, dsh_home, boot_log) {
         Ok(c) => c,
         Err(e) => return WaitOutcome::SpawnErr(e.to_string()),
@@ -721,7 +751,7 @@ fn spawn_and_await(
             }
 
             debug_log("start_dsh: ready (stable)");
-            return WaitOutcome::Ready;
+            return WaitOutcome::Ready(generation);
         }
         let died = app
             .state::<AppState>()
@@ -988,8 +1018,16 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                     .store(false, Ordering::SeqCst);
                 show_main_window(app);
             }
-            "upgrade_dsh" => run_upgrade_dsh(app.clone()),
-            "reset_dsh" => run_reset_dsh(app.clone()),
+            "upgrade_dsh" => {
+                // User is present and clicked — leave silent mode so the
+                // window shows and errors surface in the UI.
+                app.state::<AppState>().silent.store(false, Ordering::SeqCst);
+                run_upgrade_dsh(app.clone());
+            }
+            "reset_dsh" => {
+                app.state::<AppState>().silent.store(false, Ordering::SeqCst);
+                run_reset_dsh(app.clone());
+            }
             "update" => check_update_shell(app),
             "diagnose" => {
                 app.state::<AppState>()
@@ -1206,6 +1244,7 @@ pub fn run() {
             booting: AtomicBool::new(false),
             quitting: AtomicBool::new(false),
             restart_count: Mutex::new(0),
+            spawn_generation: AtomicU64::new(0),
         })
         .setup(move |app| {
             if let Some(w) = app.get_webview_window("main") {

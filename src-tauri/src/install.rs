@@ -97,6 +97,34 @@ fn pre_gt(a: &str, b: &str) -> bool {
     false
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desired_version_is_parsed_from_spec() {
+        assert_eq!(desired_dsh_version(), "0.1.6-alpha.1");
+    }
+
+    #[test]
+    fn upgrade_targets_newer_versions_only() {
+        let d = |p: &str| should_upgrade_to(p);
+        assert!(d("0.1.1-rc.2")); // the shipped-0.1.0-era runtime
+        assert!(d("0.1.5-rc.2"));
+        assert!(d("0.1.6-alpha.0"));
+        assert!(!d("0.1.6-alpha.1")); // exact pin
+        assert!(!d("0.1.6-alpha.2")); // newer alpha — never downgrade
+        assert!(!d("0.1.6-rc.1")); // rc > alpha
+        assert!(!d("0.1.6")); // release > alpha
+        assert!(!d("0.1.7-alpha.1")); // future release — never downgrade
+        assert!(d("garbage")); // unparsable installed → try to fix it
+    }
+
+    fn should_upgrade_to(installed: &str) -> bool {
+        version_gt(desired_dsh_version(), installed)
+    }
+}
+
 const NODE_SETUP_PS1: &str = r#"$ErrorActionPreference = 'Stop'
 $idx = curl.exe -sL --fail 'https://nodejs.org/dist/index.json'
 $json = $idx | ConvertFrom-Json

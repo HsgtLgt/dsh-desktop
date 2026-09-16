@@ -7,7 +7,9 @@ use crate::install::NPM_ALLOW_SCRIPTS;
 use crate::settings::Settings;
 
 /// How long `dsh --dump-config` may run before we treat it as wedged.
-const DUMP_CONFIG_TIMEOUT: Duration = Duration::from_secs(20);
+/// Generous on purpose: slow disks / antivirus scanning can make a healthy
+/// profile slow, and a false positive here quarantines a perfectly good tree.
+const DUMP_CONFIG_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Ensure the `web` profile can actually boot. dsh manages
 /// `profiles/<name>/node_modules` via symlinks and hard-crashes on an
@@ -162,4 +164,51 @@ fn drain_to_void<R: Read + Send + 'static>(mut reader: R) {
 pub fn user_dsh_home() -> Option<PathBuf> {
     let profile = std::env::var_os("USERPROFILE")?;
     Some(PathBuf::from(profile).join(".dsh"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corruption_markers_match_real_crashes() {
+        // The exact failure seen on a machine with a stale profile tree.
+        let real = "退出码：exit code: 1 --- dsh 输出尾部 --- [ERR_MODULE_NOT_FOUND]: \
+                    Cannot find package '@deepseek-ai/dsh-client-ui-settings' imported from \
+                    C:\\Users\\x\\.dsh\\profiles\\web\\ at Object.getPackageJSONURL";
+        assert!(looks_like_profile_corruption(real));
+
+        let symlink = "Error: dsh: ...\\profiles\\node_modules\\@deepseek-ai\\dsh exists and is \
+                       not a symlink; remove it so dsh can manage the installation fallback\n    \
+                       at ensureSymlink (file:///...dsh-app-boot/lib/index.js:379:37)\n    at \
+                       healProfilesModuleFallback (file:///...dsh-app-boot/lib/index.js:436:3)";
+        assert!(looks_like_profile_corruption(symlink));
+
+        assert!(!looks_like_profile_corruption("退出码：exit code: 0"));
+        assert!(!looks_like_profile_corruption("在限定时间内未能就绪。"));
+    }
+
+    #[test]
+    fn quarantine_renames_profile_and_store() {
+        let tmp = std::env::temp_dir().join(format!("dsh-quarantine-test-{}", std::process::id()));
+        let web = tmp.join("profiles").join("web");
+        let store = tmp.join("profiles").join("node_modules");
+        std::fs::create_dir_all(web.join("node_modules")).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(web.join("cordis.yml"), "test").unwrap();
+
+        let msg = quarantine_web_profile(&tmp).unwrap();
+        assert!(msg.contains("备份"), "{msg}");
+        assert!(!web.exists() && !store.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.join("profiles"))
+            .unwrap()
+            .collect();
+        assert_eq!(leftovers.len(), 2, "web and node_modules both backed up");
+
+        // No-op when there is nothing to quarantine.
+        let msg2 = quarantine_web_profile(&tmp).unwrap();
+        assert!(msg2.contains("不存在"), "{msg2}");
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 }
