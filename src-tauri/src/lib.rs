@@ -388,6 +388,21 @@ fn navigate_to_splash(app: &AppHandle) {
     }
 }
 
+/// Drop every cached web resource (HTTP cache, service worker, cookies) of the
+/// shell's webview. Required whenever the dsh profile tree is rebuilt: the
+/// client loads UI plugin chunks through the WebView cache, and stale chunks
+/// from a previous broken state can fail to import even though the server now
+/// serves a fresh build. The dsh auth cookie is wiped too — re-minted on the
+/// next token-URL navigation, so nothing is lost.
+fn clear_webview_cache(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        match w.clear_all_browsing_data() {
+            Ok(_) => debug_log("webview browsing data cleared"),
+            Err(e) => debug_log(&format!("clear browsing data failed: {e}")),
+        }
+    }
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -583,6 +598,8 @@ fn boot_inner(app: &AppHandle, silent: bool) {
             Ok(Some(msg)) => {
                 debug_log(&format!("profile repair: {msg}"));
                 emit(app, "starting", "正在修复 DSH 配置…", Some(msg));
+                // The client cache belongs to the old profile build — drop it.
+                clear_webview_cache(app);
             }
             Ok(None) => {}
             Err(e) => debug_log(&format!("profile repair failed (continuing): {e}")),
@@ -637,6 +654,7 @@ fn start_dsh_and_wait(app: &AppHandle, settings: &Settings, dsh_home: &Path, sil
                                 "检测到 DSH 配置损坏，正在自动修复后重启…",
                                 Some(msg),
                             );
+                            clear_webview_cache(app);
                             continue;
                         }
                         Err(e) => debug_log(&format!("profile crash-repair failed: {e}")),
@@ -853,6 +871,47 @@ fn run_upgrade_dsh(app: AppHandle) {
     });
 }
 
+/// One-click hammer for failures the crash detector can't see (e.g. a client
+/// UI plugin failing to import): stop the service, quarantine the profile
+/// tree, drop the webview cache, and boot into a guaranteed-fresh state.
+fn run_reset_dsh(app: AppHandle) {
+    std::thread::spawn(move || {
+        notify(&app, "重置 DSH 配置", "正在停止服务并重建配置…");
+        emit(&app, "installing", "正在重置 DSH 配置…", None);
+        kill_spawned_child(&app);
+
+        let (paths, _settings) = match load_or_recover_settings(&app) {
+            Ok(v) => v,
+            Err(e) => {
+                notify(&app, "重置失败", &e);
+                return;
+            }
+        };
+        *app.state::<AppState>().paths.lock().unwrap() = Some(paths.clone());
+
+        let dsh_home = match user_dsh_home() {
+            Some(h) => h,
+            None => {
+                notify(&app, "重置失败", "无法解析用户目录（USERPROFILE）");
+                return;
+            }
+        };
+        match profile_repair::quarantine_web_profile(&dsh_home) {
+            Ok(msg) => {
+                debug_log(&format!("manual reset: {msg}"));
+                notify(&app, "重置完成", &format!("{msg}，正在重启服务…"));
+            }
+            Err(e) => notify(&app, "重置", &format!("备份旧配置失败（继续尝试启动）：{e}")),
+        }
+        clear_webview_cache(&app);
+
+        app.state::<AppState>()
+            .booting
+            .store(false, Ordering::SeqCst);
+        boot(app);
+    });
+}
+
 fn check_update_shell(app: &AppHandle) {
     use tauri_plugin_updater::UpdaterExt;
     let app = app.clone();
@@ -894,6 +953,7 @@ fn check_update_shell(app: &AppHandle) {
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
     let upgrade_dsh_item = MenuItem::with_id(app, "upgrade_dsh", "升级 DSH（手动）", true, None::<&str>)?;
+    let reset_dsh = MenuItem::with_id(app, "reset_dsh", "重置 DSH 配置（修复界面异常）", true, None::<&str>)?;
     let update_shell = MenuItem::with_id(app, "update", "检查壳更新", true, None::<&str>)?;
     let diagnose = MenuItem::with_id(app, "diagnose", "打开诊断页", true, None::<&str>)?;
     let autostart = CheckMenuItem::with_id(
@@ -910,6 +970,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         &[
             &show,
             &upgrade_dsh_item,
+            &reset_dsh,
             &update_shell,
             &diagnose,
             &autostart,
@@ -928,6 +989,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 show_main_window(app);
             }
             "upgrade_dsh" => run_upgrade_dsh(app.clone()),
+            "reset_dsh" => run_reset_dsh(app.clone()),
             "update" => check_update_shell(app),
             "diagnose" => {
                 app.state::<AppState>()
