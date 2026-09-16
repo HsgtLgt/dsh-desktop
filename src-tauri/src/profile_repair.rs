@@ -14,6 +14,11 @@ const DUMP_CONFIG_TIMEOUT: Duration = Duration::from_secs(20);
 /// inconsistent tree (e.g. left behind by a different dsh version), so we
 /// probe with `--dump-config` before every spawn and quarantine a broken
 /// profile; the next dsh start rebuilds it fresh.
+///
+/// `--dump-config` composes the profile but does not load UI plugins, so a
+/// stale profile can still pass it and crash later in `dsh web`; the boot path
+/// additionally calls [`quarantine_web_profile`] when the child dies with a
+/// matching crash signature.
 pub fn ensure_web_profile(settings: &Settings, dsh_home: &Path) -> Result<Option<String>, String> {
     let web = dsh_home.join("profiles").join("web");
     if !web.is_dir() {
@@ -24,8 +29,50 @@ pub fn ensure_web_profile(settings: &Settings, dsh_home: &Path) -> Result<Option
         return Ok(None);
     }
 
-    let msg = reset_web_profile(&web)?;
-    Ok(Some(msg))
+    Some(quarantine_web_profile(dsh_home)).transpose()
+}
+
+/// Rename the web profile and the shared `profiles/node_modules` store aside
+/// (`.bak.<stamp>`) so dsh rebuilds them fresh. Rename instead of delete: the
+/// profile may hold user patches (cordis.yml…).
+pub fn quarantine_web_profile(dsh_home: &Path) -> Result<String, String> {
+    let profiles = dsh_home.join("profiles");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut moved: Vec<String> = Vec::new();
+    for name in ["web", "node_modules"] {
+        let dir = profiles.join(name);
+        if dir.exists() {
+            let backup = profiles.join(format!("{name}.bak.{stamp}"));
+            std::fs::rename(&dir, &backup)
+                .map_err(|e| format!("无法备份 {name}：{e}"))?;
+            moved.push(format!("{name} → {}", backup.display()));
+        }
+    }
+    if moved.is_empty() {
+        return Ok("web profile 不存在，将由 dsh 自动重建".into());
+    }
+
+    Ok(format!(
+        "检测到 web 配置无法启动，已备份（{}），将自动重建",
+        moved.join("；")
+    ))
+}
+
+/// Crash signatures that mean "the web profile tree itself is broken" —
+/// typically a profile left by a different dsh version.
+pub fn looks_like_profile_corruption(detail: &str) -> bool {
+    const MARKERS: [&str; 5] = [
+        "ERR_MODULE_NOT_FOUND",
+        "Cannot find package",
+        "healProfilesModuleFallback",
+        "ensureSymlink",
+        ".dsh-module-fallback",
+    ];
+    MARKERS.iter().any(|m| detail.contains(m))
 }
 
 fn dump_config_ok(settings: &Settings, dsh_home: &Path) -> bool {
@@ -33,25 +80,6 @@ fn dump_config_ok(settings: &Settings, dsh_home: &Path) -> bool {
         run_dsh_with_timeout(settings, dsh_home, &["--profile", "web", "--dump-config"]),
         Some(output) if output.status.success()
     )
-}
-
-fn reset_web_profile(web: &Path) -> Result<String, String> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let backup = web
-        .parent()
-        .ok_or_else(|| "profiles 目录异常".to_string())?
-        .join(format!("web.bak.{stamp}"));
-
-    std::fs::rename(web, &backup)
-        .map_err(|e| format!("无法备份损坏的 web profile：{e}"))?;
-
-    Ok(format!(
-        "检测到 web profile 无法启动，已备份到 {}，将自动重建",
-        backup.display()
-    ))
 }
 
 fn run_dsh_with_timeout(

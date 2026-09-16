@@ -592,7 +592,72 @@ fn boot_inner(app: &AppHandle, silent: bool) {
     start_dsh_and_wait(app, &settings, &dsh_home, silent);
 }
 
+enum WaitOutcome {
+    Ready,
+    SpawnErr(String),
+    Exited { detail: String },
+    Timeout { detail: String },
+}
+
 fn start_dsh_and_wait(app: &AppHandle, settings: &Settings, dsh_home: &Path, silent: bool) {
+    let dsh_home = dsh_home.to_path_buf();
+    for attempt in 0..2u8 {
+        match spawn_and_await(app, settings, &dsh_home) {
+            WaitOutcome::Ready => {
+                *app.state::<AppState>().restart_count.lock().unwrap() = 0;
+                emit(app, "ready", "DSH 已就绪", None);
+                navigate_to_dsh(app, effective_port(settings));
+                if !silent {
+                    show_main_window(app);
+                }
+                watch_child_after_ready(app.clone(), silent);
+                return;
+            }
+            WaitOutcome::SpawnErr(e) => {
+                fail(
+                    app,
+                    silent,
+                    "spawning",
+                    "启动 DSH 失败",
+                    Some(format!("无法启动进程：{e}")),
+                );
+                return;
+            }
+            WaitOutcome::Exited { detail } => {
+                // A stale profile from another dsh version crashes the child
+                // before it serves; quarantine it and retry exactly once so
+                // dsh rebuilds the profile fresh.
+                if attempt == 0 && profile_repair::looks_like_profile_corruption(&detail) {
+                    match profile_repair::quarantine_web_profile(&dsh_home) {
+                        Ok(msg) => {
+                            debug_log(&format!("profile crash-repair: {msg}"));
+                            emit(
+                                app,
+                                "starting",
+                                "检测到 DSH 配置损坏，正在自动修复后重启…",
+                                Some(msg),
+                            );
+                            continue;
+                        }
+                        Err(e) => debug_log(&format!("profile crash-repair failed: {e}")),
+                    }
+                }
+                fail(app, silent, "exited", "DSH 进程已退出", Some(detail));
+                return;
+            }
+            WaitOutcome::Timeout { detail } => {
+                fail(app, silent, "timeout", "DSH 启动超时", Some(detail));
+                return;
+            }
+        }
+    }
+}
+
+fn spawn_and_await(
+    app: &AppHandle,
+    settings: &Settings,
+    dsh_home: &Path,
+) -> WaitOutcome {
     let port = effective_port(settings);
     let boot_log = app.state::<AppState>().boot_log.clone();
     {
@@ -602,16 +667,7 @@ fn start_dsh_and_wait(app: &AppHandle, settings: &Settings, dsh_home: &Path, sil
 
     let child = match spawn_dsh(settings, dsh_home, boot_log) {
         Ok(c) => c,
-        Err(e) => {
-            fail(
-                app,
-                silent,
-                "spawning",
-                "启动 DSH 失败",
-                Some(format!("无法启动进程：{e}")),
-            );
-            return;
-        }
+        Err(e) => return WaitOutcome::SpawnErr(e.to_string()),
     };
     *app.state::<AppState>().child.lock().unwrap() = Some(child);
 
@@ -640,22 +696,14 @@ fn start_dsh_and_wait(app: &AppHandle, settings: &Settings, dsh_home: &Path, sil
                 } else {
                     format!("服务刚就绪即退出。\n\n--- dsh 输出尾部 ---\n{tail}")
                 };
-                fail(app, silent, "exited", "DSH 进程已退出", Some(detail));
-                return;
+                return WaitOutcome::Exited { detail };
             }
             if !probe(port) {
                 continue;
             }
 
             debug_log("start_dsh: ready (stable)");
-            *app.state::<AppState>().restart_count.lock().unwrap() = 0;
-            emit(app, "ready", "DSH 已就绪", None);
-            navigate_to_dsh(app, port);
-            if !silent {
-                show_main_window(app);
-            }
-            watch_child_after_ready(app.clone(), silent);
-            return;
+            return WaitOutcome::Ready;
         }
         let died = app
             .state::<AppState>()
@@ -671,9 +719,7 @@ fn start_dsh_and_wait(app: &AppHandle, settings: &Settings, dsh_home: &Path, sil
             } else {
                 format!("退出码：{status}\n\n--- dsh 输出尾部 ---\n{tail}")
             };
-            // Limited auto-restart after Ready is handled elsewhere; here it's first boot.
-            fail(app, silent, "exited", "DSH 进程已退出", Some(detail));
-            return;
+            return WaitOutcome::Exited { detail };
         }
         std::thread::sleep(interval);
     }
@@ -684,7 +730,7 @@ fn start_dsh_and_wait(app: &AppHandle, settings: &Settings, dsh_home: &Path, sil
     } else {
         format!("在限定时间内未能就绪。\n\n--- dsh 输出尾部 ---\n{tail}")
     };
-    fail(app, silent, "timeout", "DSH 启动超时", Some(detail));
+    WaitOutcome::Timeout { detail }
 }
 
 fn run_install_wizard(app: AppHandle) {
