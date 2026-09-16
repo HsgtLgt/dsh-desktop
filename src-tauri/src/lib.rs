@@ -55,6 +55,9 @@ struct AppState {
     /// upgrade/reset's intentional kill would surface as a ghost "DSH 已退出"
     /// error, and stale watcher threads would pile up.
     spawn_generation: AtomicU64,
+    /// Auto-resets triggered by client-side failure detection this app run.
+    /// Capped so a persistent failure cannot loop forever.
+    client_resets: AtomicU64,
 }
 
 #[derive(Clone, Serialize)]
@@ -384,9 +387,176 @@ fn navigate_to_dsh(app: &AppHandle, port: u16) {
     let url = extract_announced_url(app, port)
         .unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
     if let Some(w) = app.get_webview_window("main") {
-        let res = w.navigate(Url::parse(&url).expect("valid URL"));
-        debug_log(&format!("navigate to {url}: {:?}", res.map(|_| "ok")));
+        let ok = w.navigate(Url::parse(&url).expect("valid URL")).is_ok();
+        debug_log(&format!("navigate to {url}: {}", if ok { "ok" } else { "failed" }));
+        if ok {
+            install_client_failure_watch(&w);
+        }
     }
+}
+/// JS watchdog injected into the dsh page. Client UI failures (e.g.
+/// "Failed to load plugins … import failed") never reach the shell as process
+/// crashes, so the page reports them the only channel it has: document.title.
+/// `title_failure_detail` decides what counts; the conjunction with dsh's
+/// internal "web boot:" line is required so ordinary chat text mentioning
+/// errors can never trigger a reset.
+const CLIENT_WATCH_JS: &str = r#"(function(){
+  if (window.__dshShellWatch) return;
+  window.__dshShellWatch = true;
+  var headings = ["Failed to load plugins", "加载插件失败"];
+  var seen = false;
+  setInterval(function(){
+    if (seen) return;
+    var t = "";
+    try { t = (document.body && document.body.innerText) || ""; } catch (e) { return; }
+    if (!t) return;
+    var fail = headings.some(function(m){ return t.indexOf(m) !== -1; });
+    if (!fail || t.indexOf("web boot:") === -1) return;
+    seen = true;
+    var lines = t.split("\n").filter(function(l){ return l && l.length < 200; }).slice(0, 8).join(" | ");
+    document.title = "[DSH-ERR] " + lines.slice(0, 400);
+  }, 1500);
+})();"#;
+
+/// Decide whether a webview title (or any page text) reports the dsh client
+/// plugin-failure screen. Requires BOTH a failure heading and dsh's internal
+/// "web boot:" activation line — chat content quoting an error alone must not
+/// trip this, because a false positive resets the user's running session.
+fn title_failure_detail(title: &str) -> Option<String> {
+    let rest = title.strip_prefix("[DSH-ERR] ")?;
+    let fail_heading = rest.contains("Failed to load plugins") || rest.contains("加载插件失败");
+    if fail_heading && rest.contains("web boot:") {
+        Some(rest.to_string())
+    } else {
+        None
+    }
+}
+
+fn install_client_failure_watch(w: &tauri::WebviewWindow) {
+    // Give the new document a moment; the script itself tolerates being run
+    // before body exists.
+    let w = w.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(2000));
+        match w.eval(CLIENT_WATCH_JS) {
+            Ok(_) => debug_log("client failure watch injected"),
+            Err(e) => debug_log(&format!("client watch eval failed: {e}")),
+        }
+    });
+}
+
+/// Watch document.title for the failure marker injected above and auto-run the
+/// reset flow (quarantine + cache clear + reboot) when a client-side failure
+/// appears — the class of failure no process crash ever reports. Capped.
+fn arm_client_failure_watch(app: AppHandle, generation: u64) {
+    std::thread::spawn(move || {
+        debug_log(&format!("client failure watch armed (gen {generation})"));
+        loop {
+            std::thread::sleep(Duration::from_millis(2000));
+            let state = app.state::<AppState>();
+            if state.quitting.load(Ordering::SeqCst)
+                || state.spawn_generation.load(Ordering::SeqCst) != generation
+            {
+                return;
+            }
+            let title = app
+                .get_webview_window("main")
+                .and_then(|w| w.title().ok())
+                .unwrap_or_default();
+            let Some(detail) = title_failure_detail(&title) else {
+                continue;
+            };
+            debug_log(&format!("client failure detected: {detail}"));
+            write_last_error(&app, "client-ui", "DSH 界面插件加载失败", Some(detail.to_string()));
+            append_boot_file(&app, &format!("CLIENT-FAIL {detail}"));
+
+            let resets = state.client_resets.fetch_add(1, Ordering::SeqCst);
+            if resets >= 2 {
+                emit(
+                    &app,
+                    "error",
+                    "DSH 界面插件加载失败（已自动重置 2 次仍未恢复）",
+                    Some(format!(
+                        "{detail}\n\n请点托盘「诊断」查看详情；若反复出现，可能是 WebView2 运行时过旧或杀毒软件拦截，见 README 常见问题。"
+                    )),
+                );
+                return;
+            }
+
+            emit(
+                &app,
+                "installing",
+                &format!("检测到界面加载异常，正在自动重置（第 {} 次）…", resets + 1),
+                Some(detail.to_string()),
+            );
+            kill_spawned_child(&app);
+            if let Some(dsh_home) = user_dsh_home() {
+                match profile_repair::quarantine_web_profile(&dsh_home) {
+                    Ok(msg) => debug_log(&format!("client-failure reset: {msg}")),
+                    Err(e) => debug_log(&format!("client-failure reset quarantine failed: {e}")),
+                }
+            }
+            clear_webview_cache(&app);
+            drop(state);
+            app.state::<AppState>()
+                .booting
+                .store(false, Ordering::SeqCst);
+            boot(app);
+            return;
+        }
+    });
+}
+
+/// Best-effort WebView2 runtime version. Old Chromium cannot parse newer UI
+/// plugin JS — a class of failure that looks exactly like random plugin import
+/// errors. Logged at boot; user notified when clearly outdated.
+fn check_webview2_runtime(app: &AppHandle) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let keys = [
+            r"HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+            r"HKCU\Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+        ];
+        let mut version = None;
+        for key in keys {
+            if let Ok(o) = Command::new("reg")
+                .args(["query", key, "/v", "pv"])
+                .creation_flags(0x08000000)
+                .output()
+            {
+                let text = String::from_utf8_lossy(&o.stdout);
+                if let Some(v) = parse_pv_output(&text) {
+                    version = Some(v);
+                    break;
+                }
+            }
+        }
+        debug_log(&format!("webview2 runtime: {:?}", version));
+        if let Some(v) = version {
+            let major: u32 = v.split('.').next().and_then(|m| m.parse().ok()).unwrap_or(0);
+            if major < 110 {
+                notify(
+                    app,
+                    "WebView2 运行时过旧",
+                    &format!(
+                        "检测到 WebView2 {v}，可能无法加载新版界面插件。请安装最新运行时：https://developer.microsoft.com/microsoft-edge/webview2/"
+                    ),
+                );
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+}
+
+/// Extract the `pv  REG_SZ  <version>` value from a `reg query` output.
+fn parse_pv_output(text: &str) -> Option<String> {
+    text.lines()
+        .filter(|l| l.trim_start().starts_with("pv"))
+        .filter_map(|l| l.split_whitespace().next_back())
+        .find(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(|s| s.to_string())
 }
 
 fn navigate_to_splash(app: &AppHandle) {
@@ -665,6 +835,7 @@ fn start_dsh_and_wait(app: &AppHandle, settings: &Settings, dsh_home: &Path, sil
                     show_main_window(app);
                 }
                 watch_child_after_ready(app.clone(), silent, generation);
+                arm_client_failure_watch(app.clone(), generation);
                 return;
             }
             WaitOutcome::SpawnErr(e) => {
@@ -1258,6 +1429,7 @@ pub fn run() {
             quitting: AtomicBool::new(false),
             restart_count: Mutex::new(0),
             spawn_generation: AtomicU64::new(0),
+            client_resets: AtomicU64::new(0),
         })
         .setup(move |app| {
             if let Some(w) = app.get_webview_window("main") {
@@ -1268,6 +1440,10 @@ pub fn run() {
             setup_tray(app.handle())?;
             if silent {
                 hide_main_window(app.handle());
+            }
+            {
+                let app = app.handle().clone();
+                std::thread::spawn(move || check_webview2_runtime(&app));
             }
             // Backend owns the initial boot for both paths
             boot(app.handle().clone());
@@ -1306,4 +1482,51 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::title_failure_detail;
+
+    #[test]
+    fn detects_the_real_plugin_failure_screen() {
+        // Exact shape photographed from a failing machine.
+        let t = "[DSH-ERR] HARNESS | Failed to load plugins \
+                 | @deepseek-ai/dsh-client-ui-sidebar-documentpreview \
+                 | web boot: 1 entry did not activate \
+                 | @deepseek-ai/dsh-client-ui-sidebar-documentpreview: import failed";
+        let d = title_failure_detail(t).expect("must detect");
+        assert!(d.contains("sidebar-documentpreview"));
+    }
+
+    #[test]
+    fn ignores_normal_titles_and_chat_quoted_errors() {
+        assert!(title_failure_detail("DSH Desktop").is_none());
+        assert!(title_failure_detail("HARNESS").is_none());
+        // Chat content quoting an error must never trip the reset: no
+        // "web boot:" activation line present.
+        assert!(title_failure_detail("[DSH-ERR] 会话里提到 导入失败 / import failed").is_none());
+        // Activation line alone (normal startup text) is not a failure.
+        assert!(title_failure_detail("[DSH-ERR] web boot: all plugins activated").is_none());
+    }
+}
+
+#[cfg(test)]
+mod pv_tests {
+    use super::parse_pv_output;
+
+    #[test]
+    fn parses_real_reg_query_output() {
+        let out = String::from_utf8_lossy(
+            b"\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}\r\n    pv    REG_SZ    153.0.4234.32\r\n\r\n",
+        )
+        .to_string();
+        assert_eq!(parse_pv_output(&out).as_deref(), Some("153.0.4234.32"));
+    }
+
+    #[test]
+    fn rejects_missing_key_output() {
+        assert_eq!(parse_pv_output("\r\n错误: 系统找不到指定的注册表项或值。\r\n"), None);
+        assert_eq!(parse_pv_output(""), None);
+    }
 }
