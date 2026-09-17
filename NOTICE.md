@@ -28,9 +28,18 @@
 - 许可：MIT
 - 用途：随包分发，供桌面端管理插件 profile
 
+## LibreOffice（LibreOfficeKit）
+
+- 来源：<https://www.libreoffice.org/>（随 DSH 的 `@deepseek-ai/libreoffice-kit-win32-x64` 分发，
+  该包声明 `MPL-2.0`，内含 `licenses/` 与 `sources/` 目录）
+- 许可：MPL-2.0
+- 用途：DSH 的 Office → PDF 技能（`dsh-skill-office`）所需的文档转换引擎
+- 说明：**仅从 alpha.2 起随包分发**，约 325 MB，是安装体积的主要来源
+
 ## 其他
 
 运行时依赖树中包含若干 npm 包，各自许可见其 `package.json`。常见的有 MIT / ISC / Apache-2.0。
+alpha.2 起运行时还包含原生二进制（`node-pty`、`sharp`、`koffi` 等）与其许可文件。
 
 ---
 

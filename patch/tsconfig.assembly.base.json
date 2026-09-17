@@ -18,6 +18,11 @@
     ],
     "noUnusedLocals": false,
     "noUnusedParameters": false,
-    "useDefineForClassFields": true
+    "useDefineForClassFields": true,
+    "paths": {
+      "@deepseek-ai/dsh/profile-boot": [
+        "./node_modules/@deepseek-ai/dsh/lib/types/profile-boot.d.ts"
+      ]
+    }
   }
 }

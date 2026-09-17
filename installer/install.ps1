@@ -48,7 +48,7 @@ foreach ($dir in @($desktop, $startMenu)) {
 $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\DeepSeekHarness'
 New-Item -Path $key -Force | Out-Null
 Set-ItemProperty -Path $key -Name DisplayName -Value 'DeepSeek Harness'
-Set-ItemProperty -Path $key -Name DisplayVersion -Value '0.1.6-alpha.1'
+Set-ItemProperty -Path $key -Name DisplayVersion -Value '__DSH_VERSION__'
 Set-ItemProperty -Path $key -Name Publisher -Value 'DeepSeek'
 Set-ItemProperty -Path $key -Name InstallLocation -Value $InstallDir
 Set-ItemProperty -Path $key -Name UninstallString -Value ('"' + (Join-Path $InstallDir 'uninstall.cmd') + '"')

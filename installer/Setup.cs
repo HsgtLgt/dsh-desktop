@@ -202,7 +202,8 @@ internal sealed class WizardForm : Form
         header.Controls.Add(title);
 
         Label subtitle = new Label();
-        subtitle.Text = "Windows 桌面版 · 对应官方 DSH 0.1.6-alpha.1";
+        // 版本占位符：由 scripts/build-installer.mjs 按 vars.mjs 的 DSH_VERSION 替换
+        subtitle.Text = "Windows 桌面版 · 对应官方 DSH __DSH_VERSION__";
         subtitle.ForeColor = Color.FromArgb(110, 118, 132);
         subtitle.Location = new Point(86, 46);
         subtitle.AutoSize = true;
@@ -522,6 +523,22 @@ internal sealed class WizardForm : Form
         if (pageIndex == 2)
         {
             installDir = pathBox.Text.Trim();
+            // 覆盖安装时目标文件可能被正在运行的实例占用，robocopy 会失败。
+            // 这也是升级场景的常态，所以在这里询问并自动关闭。
+            if (IsTargetAppRunning())
+            {
+                DialogResult answer = MessageBox.Show(
+                    "DeepSeek Harness 正在运行。安装前需要先关闭它，否则正在使用的文件无法替换。"
+                        + Environment.NewLine + Environment.NewLine
+                        + "是否自动关闭并继续安装？",
+                    "DeepSeek Harness 安装程序",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                if (answer != DialogResult.Yes)
+                {
+                    return;
+                }
+                StopTargetApp();
+            }
             StartInstall();
             return;
         }
@@ -530,6 +547,72 @@ internal sealed class WizardForm : Form
             return;
         }
         ShowPage(pageIndex + 1);
+    }
+
+    // ── 处理运行中的实例 ────────────────────────────────────────
+    private static bool IsTargetAppRunning()
+    {
+        try
+        {
+            Process[] running = Process.GetProcessesByName("DeepSeek Harness");
+            bool found = running.Length > 0;
+            for (int i = 0; i < running.Length; i++)
+            {
+                running[i].Dispose();
+            }
+            return found;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void StopTargetApp()
+    {
+        try
+        {
+            Process[] running = Process.GetProcessesByName("DeepSeek Harness");
+            for (int i = 0; i < running.Length; i++)
+            {
+                try
+                {
+                    running[i].Kill();
+                }
+                catch
+                {
+                    // 单个进程结束失败不阻断
+                }
+                running[i].Dispose();
+            }
+        }
+        catch
+        {
+            // 忽略
+        }
+        // 给子进程（内置 Node 承载的 Host）留出退出时间，随后确认一遍
+        for (int attempt = 0; attempt < 20; attempt++)
+        {
+            Thread.Sleep(400);
+            if (!IsTargetAppRunning())
+            {
+                return;
+            }
+        }
+        try
+        {
+            Process[] remaining = Process.GetProcessesByName("DeepSeek Harness");
+            for (int i = 0; i < remaining.Length; i++)
+            {
+                try { remaining[i].Kill(); } catch { }
+                remaining[i].Dispose();
+            }
+        }
+        catch
+        {
+            // 忽略
+        }
+        Thread.Sleep(800);
     }
 
     // ── 安装流程 ────────────────────────────────────────────────
@@ -808,7 +891,7 @@ internal sealed class WizardForm : Form
                     return;
                 }
                 registry.SetValue("DisplayName", "DeepSeek Harness");
-                registry.SetValue("DisplayVersion", "0.1.6-alpha.1");
+                registry.SetValue("DisplayVersion", "__DSH_VERSION__");
                 registry.SetValue("Publisher", "DeepSeek");
                 registry.SetValue("InstallLocation", installDir);
                 registry.SetValue("UninstallString", "\"" + Path.Combine(installDir, "uninstall.cmd") + "\"");

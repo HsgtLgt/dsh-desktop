@@ -12,6 +12,8 @@ copyright: DeepSeek
 directories:
   output: .desktop-build/targets/win-x64/artifacts
 
+# alpha.2 的壳按 new URL('./preload-*.cjs', import.meta.url) 解析 preload，
+# 三个 CJS 必须与 main.js 同目录进包；renderer/ 由 loadFile 按 app 根相对路径加载。
 files:
   - lib/**/*
   - renderer/**/*
@@ -23,6 +25,21 @@ electronDist: __ELECTRON_DIST__
 
 # 关闭 asar：运行时组件（dsh / runtime）必须以真实文件存在
 asar: false
+
+# Host 以内置 Node 的形态启动（--expose-internals），需要 Electron 的 runAsNode 保险丝保持开启
+electronFuses:
+  runAsNode: true
+
+# 官方打包从 .env.windows 取这两个值写进 package.json 的额外元数据；
+# 打包态壳从 app 元数据里读它们（开发态才读进程环境变量）。
+extraMetadata:
+  dshDesktopAppId: com.deepseek.harness
+  dshMandatoryUpdatePolicy: test
+
+# 打包态的关于面板读 resources/icon.png（icon-windows.png 是窗口图标，由壳自己从 app 目录读）
+extraResources:
+  - from: resources/icon-windows.png
+    to: icon.png
 
 # 运行时资源与依赖补齐（extraResources 会丢掉 node_modules，所以走钩子）
 afterPack: __AFTERPACK__

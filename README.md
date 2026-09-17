@@ -31,9 +31,13 @@
 
 | 版本 | 安装包 | 大小 |
 |---|---|---|
+| [v0.1.6-alpha.2](https://github.com/HsgtLgt/dsh-desktop/releases/tag/v0.1.6-alpha.2) | [DSH-Setup.exe](https://github.com/HsgtLgt/dsh-desktop/releases/download/v0.1.6-alpha.2/DSH-Setup.exe) | 392.6 MB |
 | [v0.1.6-alpha.1](https://github.com/HsgtLgt/dsh-desktop/releases/tag/v0.1.6-alpha.1) | [DSH-Setup.exe](https://github.com/HsgtLgt/dsh-desktop/releases/download/v0.1.6-alpha.1/DSH-Setup.exe) | 332 MB |
 
-对应官方 DSH `0.1.6-alpha.1`。**无需预装 Node.js 或 dsh**，运行时已内置。
+对应官方 DSH `0.1.6-alpha.2`。**无需预装 Node.js 或 dsh**，运行时已内置。
+
+> alpha.2 的运行时比 alpha.1 大不少：官方把 LibreOffice（`libreoffice-kit-win32-x64`，约 325 MB）
+> 纳入了依赖闭包，用于 Office → PDF 技能。安装后约 1.1 GB。
 
 > 安装包未做数字签名，SmartScreen 会提示「未知发布者」，选择「仍要运行」即可。
 > 校验值见 Release 说明页。
@@ -47,7 +51,9 @@
 - **pnpm**（`npm i -g pnpm`）
 - **7-Zip**（`C:\Program Files\7-Zip\7z.exe`，或用 `SEVEN_ZIP` 指定）
 - **.NET Framework 4.x**（编译安装器，Windows 自带）
-- 本机已安装 **`@deepseek-ai/dsh`**（`npm i -g @deepseek-ai/dsh`）——运行时依赖树从它复制
+- 本机已安装 **`@deepseek-ai/dsh`**（`npm i -g @deepseek-ai/dsh@0.1.6-alpha.2`）——运行时依赖树从它复制；
+  版本必须与 `DSH_VERSION` 一致，也可以用 `DSH_INSTALL_DIR` 指向别处的安装
+  （例如 `npm i --prefix .build-tmp/npm-prefix @deepseek-ai/dsh@0.1.6-alpha.2`）
 - 网络：能访问 GitHub 与 npm 镜像
 
 ## 快速开始
@@ -62,7 +68,10 @@ node scripts/build-shell.mjs
 # 3) 准备随包分发的运行时（下载 Node 官方包并校验 SHA256；复制 pnpm）
 node scripts/prepare-node.mjs
 
-# 4) 物化 dsh 运行时树（复制 + 扁平化依赖）
+# 4) 物化 dsh 运行时树（复制 + 扁平化依赖；版本必须与 DSH_VERSION 一致）
+#    没装全局 dsh 时，先装一份到独立 prefix 再指过去：
+#    npm i --prefix .build-tmp/npm-prefix @deepseek-ai/dsh@0.1.6-alpha.2
+#    $env:DSH_INSTALL_DIR = "$PWD\.build-tmp\npm-prefix\node_modules\@deepseek-ai\dsh"
 node scripts/materialize-runtime.mjs
 
 # 5) 生成运行时完整性清单 desktop-runtime.json
@@ -78,9 +87,10 @@ node scripts/make-payload.mjs
 node scripts/build-installer.mjs
 ```
 
-产物：`dsh-desktop-src/apps/desktop/.desktop-build/targets/win-x64/artifacts/DSH-Setup.exe`（约 332 MB）
+产物：`dsh-desktop-src/apps/desktop/.desktop-build/targets/win-x64/artifacts/DSH-Setup.exe`（约 393 MB）
 
-指定版本：`$env:DSH_VERSION='0.1.6-alpha.1'`（默认即此值）
+指定版本：`$env:DSH_VERSION='0.1.6-alpha.2'`（默认即此值）。版本号只有 `scripts/vars.mjs` 一处出处，
+安装器的副标题与注册表 `DisplayVersion` 由构建时占位符替换，不需要手工同步。
 
 ## 开发态运行（不打包）
 
@@ -99,13 +109,14 @@ node scripts/dev-start.mjs --check  # 启动并校验界面是否加载出来
 | 1. 欢迎 | 显示安装位置与所需磁盘空间 |
 | 2. 选择安装位置 | 默认 `%LOCALAPPDATA%\Programs\DeepSeek Harness`，可更改；路径偏长时给出提示 |
 | 3. 安装选项 | 是否创建桌面快捷方式 / 开始菜单项 |
-| 4. 安装中 | 实时进度条 + 「已处理 N / 47328 个文件」计数 |
+| 4. 安装中 | 实时进度条 + 「已处理 N / 27822 个文件」计数 |
 | 5. 完成 | 可勾选立即启动，失败时在同一页显示原因 |
 
 ![欢迎页](docs/screenshots/welcome.png)
 ![安装进度](docs/screenshots/progress.png)
 
-安装过程约 2-3 分钟（解压约 930 MB 后复制到位）。安装完成后注册到「应用和功能」。
+安装过程约 2-4 分钟（解压约 1.1 GB 后复制到位）。安装完成后注册到「应用和功能」。
+若检测到应用正在运行，向导会询问并自动关闭它（覆盖安装/升级必需）。
 
 卸载：运行安装目录下的 `uninstall.cmd`，或从「应用和功能」卸载。
 
@@ -118,7 +129,9 @@ node scripts/dev-start.mjs --check  # 启动并校验界面是否加载出来
 │   ├── bootstrap.mjs         拉官方源码 + 装配 + 装依赖
 │   ├── build-shell.mjs       编译壳与 Host
 │   ├── postbuild.mjs         tsc 后的必要修补（见上文表格）
-│   ├── bundle-preload.mjs    打包 preload
+│   ├── bundle-preload.mjs    打包三个 preload + renderer 资源
+│   ├── sync-shell-deps.mjs   从 dsh 依赖树补齐 workspace 依赖
+│   ├── version-token.mjs     安装器版本占位符替换
 │   ├── prepare-node.mjs      内置 Node + pnpm
 │   ├── materialize-runtime.mjs  物化 dsh 运行时树
 │   ├── gen-runtime-descriptor.mjs  生成完整性清单
@@ -145,10 +158,18 @@ node scripts/dev-start.mjs --check  # 启动并校验界面是否加载出来
 
 - **未做数字签名**：Windows 可能提示「未知发布者」，选「仍要运行」
 - **只支持 win-x64**：脚本里的目标路径写死了 win-x64（改 `vars.mjs` 可扩展）
-- **最终安装包不是 MSI/NSIS**：是自解压 exe，没有图形化安装向导（有控制台进度）
 - **自动更新不可用**：没有签名更新源
-- **依赖本机已装的 dsh**：运行时依赖树从本机复制，版本必须与壳一致（默认 0.1.6-alpha.1）
-- 官方 NSIS 打包链路在本方案中**未打通**（工具链下载受阻），故改用自解压
+- **依赖本机已装的 dsh**：运行时依赖树从本机（或 `DSH_INSTALL_DIR`）复制，
+  版本必须与 `DSH_VERSION` 一致（默认 `0.1.6-alpha.2`），否则 `materialize-runtime.mjs` 直接报错
+- **安装包 392.6 MB**：alpha.2 的运行时含 LibreOffice（Office → PDF 技能）与内置 Node，安装后约 1.11 GB
+- 官方 NSIS 打包链路在本方案中**未打通**（工具链下载受阻），故改用自解压 exe（带 WinForms 向导）
+
+## 版本记录
+
+| 版本 | 官方 DSH | 壳 | 内置 Node | 说明 |
+|---|---|---|---|---|
+| v0.1.6-alpha.2 | `dsh-v0.1.6-alpha.2` | Electron 44.4.1 | 24.17.0 | Host 依赖闭包换新，运行时含 LibreOffice |
+| v0.1.6-alpha.1 | `dsh-v0.1.6-alpha.1` | Electron 44.3.0 | 24.17.0 | 首个 Electron 方案版本，图形化安装向导 |
 
 ## 与旧版的关系
 

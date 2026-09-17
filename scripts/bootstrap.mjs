@@ -12,7 +12,7 @@
  * 用法：
  *   node scripts/bootstrap.mjs                # 首次准备 / 增量补齐
  *   node scripts/bootstrap.mjs --refresh      # 重新拉取源码（保留 node_modules）
- *   DSH_VERSION=0.1.6-alpha.1 node scripts/bootstrap.mjs   # 指定版本
+ *   DSH_VERSION=0.1.6-alpha.2 node scripts/bootstrap.mjs   # 指定版本
  */
 import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -136,7 +136,14 @@ async function main() {
     await writeFile(manifestPath, JSON.stringify(manifest, undefined, 2) + '\n', 'utf8');
   }
   try {
-    run('pnpm', ['install', '--ignore-workspace', '--no-frozen-lockfile'], APP);
+    // pnpm 11 默认把依赖的构建脚本列为「已忽略」，并因此以非零码退出。
+    // electron-winstaller 的构建脚本对 Electron 壳没有用处，显式忽略它、同时关掉
+    // strict-dep-builds 的失败语义，安装才算干净成功。
+    run('pnpm', [
+      'install', '--ignore-workspace', '--no-frozen-lockfile',
+      '--config.strict-dep-builds=false',
+      '--config.ignored-built-dependencies=electron-winstaller',
+    ], APP);
   } finally {
     await writeFile(manifestPath, original, 'utf8');
     console.log('  apps/desktop/package.json 已还原');

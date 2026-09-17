@@ -33,8 +33,13 @@ function resolveWork() {
     join(ROOT, 'dsh-desktop-src'),
     join(ROOT, '..', 'dsh-desktop-src'),
   ];
+  // 「已就绪」的判据有两条：官方源码在位，或工具链已装好（bootstrap 会写入根 package.json）。
+  // 只看 apps/desktop 是不够的 —— 清理旧源码后 apps 会被删掉，此时探测会误判到另一个候选目录，
+  // 于是 bootstrap 在一处空目录重新拉源码、而 node_modules 留在原来那处，两处都对不上。
+  const ready = (candidate) => existsSync(join(candidate, 'apps', 'desktop'))
+    || existsSync(join(candidate, 'node_modules', 'typescript'));
   for (const candidate of candidates) {
-    if (existsSync(join(candidate, 'apps', 'desktop'))) {
+    if (ready(candidate)) {
       return candidate;
     }
   }
@@ -70,7 +75,7 @@ export const ESBUILD = join(WORK, 'node_modules', '@esbuild', 'win32-x64', 'esbu
 export const NODE = process.execPath;
 
 /** 官方 DSH 版本，可用环境变量 DSH_VERSION 覆盖。 */
-export const DSH_VERSION = process.env.DSH_VERSION ?? '0.1.6-alpha.1';
+export const DSH_VERSION = process.env.DSH_VERSION ?? '0.1.6-alpha.2';
 /** 对应的官方 tag。 */
 export const DSH_TAG = process.env.DSH_TAG ?? ('dsh-v' + DSH_VERSION);
 

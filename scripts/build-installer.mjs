@@ -15,6 +15,7 @@ import { pipeline } from 'node:stream/promises';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { ARTIFACTS, ICON_DIR, INSTALLER, STAGE } from './vars.mjs';
+import { writeVersionedFile } from './version-token.mjs';
 
 const MARKER = 'DSHSFX1_PAYLOAD';
 const OUTPUT = join(ARTIFACTS, 'DSH-Setup.exe');
@@ -38,7 +39,10 @@ mkdirSync(STAGE, { recursive: true });
 
 // 1) 编译 setup.exe
 console.log('[1/3] 编译安装器 setup.exe ...');
-for (const name of ['Setup.cs', 'manifest.xml', 'setup.exe.config']) {
+// Setup.cs 带版本占位符，复制时按 vars.mjs 的 DSH_VERSION 替换；
+// manifest.xml 与 setup.exe.config 原样复制。
+await writeVersionedFile(join(INSTALLER, 'Setup.cs'), join(STAGE, 'Setup.cs'));
+for (const name of ['manifest.xml', 'setup.exe.config']) {
   await copyFile(join(INSTALLER, name), join(STAGE, name));
 }
 await copyFile(join(ICON_DIR, 'icon.ico'), join(STAGE, 'icon.ico'));
